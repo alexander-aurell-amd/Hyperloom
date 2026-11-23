@@ -36,7 +36,7 @@
               "const": "hyperloom.workflow_evaluation.v3"
             },
             "contract_digest": {
-              "const": "e0d44b1ababa0febbcf0bf1b416b11f62dd52d4ff3a8877cfc8f8c709e774516"
+              "const": "743153eeccbd6c1474cbd87136a50c4dc1cac548118e92a23f820ffb05f20683"
             },
             "run_flags": {
               "type": "object",
@@ -726,6 +726,7 @@
             "custom",
             "emergency",
             "enablement_attempts_exhausted",
+            "enablement_blocked_by_no_source_changes",
             "environment_fault",
             "framework_agent_phase_done",
             "global_converged",

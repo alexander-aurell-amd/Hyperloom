@@ -128,8 +128,10 @@ def _lane(session: Path, tasks: TaskRegistry, rounds: RoundStore, launch_log: st
         (EnablementLane, "maybe_rearm_enablement"),
         (EnablementLane, "_maybe_enqueue_enablement_specialist"),
         (EnablementLane, "enablement_admitted"),
+        (EnablementLane, "_reached_terminal"),
         (EnablementLane, "_check_argv_terminal"),
         (EnablementLane, "_check_environment_terminal"),
+        (EnablementLane, "_check_source_change_terminal"),
         (EnablementLane, "_environment_verdict"),
         (EnablementLane, "enablement_in_flight"),
         (EnablementLane, "_round_has_live_work"),
@@ -199,6 +201,49 @@ async def test_the_enablement_attempt_cap_stops_a_round_that_keeps_asking(
     assert await rounds.consecutive_stalled() == _ENABLEMENT_MAX_ATTEMPTS
     assert await lane._maybe_enqueue_enablement_specialist() == ""
     assert lane.shared_state.stop_reason == "enablement_attempts_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_a_round_whose_fix_no_source_changes_refuses_stops_the_run(round_slot, registry, monkeypatch):
+    """The first round that delivers a source change ends the lane: the rounds after it would be refused too."""
+    import hyperloom.agents.framework.sources as sources
+
+    from hyperloom.inference_optimizer.breakdown.stop_reasons import SOURCE_CHANGE_REFUSED_STOP_REASON
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as multi_node
+
+    monkeypatch.setattr(sources, "enumerate_candidates", lambda _request: [])
+    monkeypatch.setattr(multi_node, "is_multi_node", lambda: False)
+
+    session, _slot = round_slot
+    tasks, rounds, _locks = registry
+    lane = _lane(session, tasks, rounds, boot_log_for(LadderStage.ENGINE_INIT))
+    specialist = await lane._maybe_enqueue_enablement_specialist()
+    assert specialist
+
+    await lane.maybe_rearm_enablement(
+        {
+            "enablement": True,
+            "status": "skipped",
+            "skipped_reason": "no_source_changes",
+            "source_changes": ["1 patch(es)"],
+            "specialist_task_id": specialist,
+        }
+    )
+    assert await rounds.held() is None
+
+    assert await lane._maybe_enqueue_enablement_specialist() == ""
+    assert lane.shared_state.stop_reason == SOURCE_CHANGE_REFUSED_STOP_REASON
+    assert await rounds.consecutive_stalled() == 1
+
+
+def test_only_the_last_rounds_refused_source_change_is_held_against_the_lane():
+    """A round that settles without one clears it, so a stall for another reason leaves the lane running."""
+    lane_state = EnablementRound()
+    lane_state.record_round_defects({"status": "skipped", "source_changes": ["1 patch(es)"]})
+    assert lane_state.last_refused_source_changes == ["1 patch(es)"]
+
+    lane_state.record_round_defects({"status": "reverted"})
+    assert lane_state.last_refused_source_changes == []
 
 
 @pytest.mark.asyncio

@@ -176,6 +176,7 @@ def run_argv(spec: CampaignSpec, max_hours: float, parallel_tests: int) -> list[
 
     section = _multibranch_section(spec.multibranch)
     _refuse_launch_fields(spec)
+    _refuse_launch_config_only(spec)
     values: dict[str, Any] = {
         "model": spec.model_path,
         "framework": spec.framework_name,
@@ -289,6 +290,14 @@ def _refuse_launch_fields(spec: CampaignSpec) -> None:
             f"a multibranch run does not read {' or '.join(given)}: give the base launch as"
             " multibranch.reference_script, a shell launch script whose 'export NAME=value' lines set its environment"
             " and whose server command carries its flags"
+        )
+
+
+def _refuse_launch_config_only(spec: CampaignSpec) -> None:
+    if spec.source_changes is False:
+        raise HostedRefused(
+            "a multibranch run does not read options.source_changes: its branches keep source changes, so it cannot"
+            " hold a session to server arguments and environment variables; use flow 'single' for that"
         )
 
 

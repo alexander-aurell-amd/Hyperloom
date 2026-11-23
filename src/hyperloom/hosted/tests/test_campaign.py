@@ -92,6 +92,7 @@ REFUSALS = [
     (_with(MINIMAL, "launch", {"extra_env": {"A=B": "1"}}), "launch.extra_env has the invalid name 'A=B'"),
     (_with(MINIMAL, "launch", {"server_args": ["x"]}), "launch.server_args must be a string"),
     (_with(MINIMAL, "options", {"kernel": "yes"}), "options.kernel must be true or false"),
+    (_with(MINIMAL, "options", {"source_changes": "no"}), "options.source_changes must be true or false"),
     (_with(MINIMAL, "options", {"eval": False}), "options.eval must be one of True, got False"),
     (_with(MINIMAL, "options", {"enablement": "some"}), "options.enablement must be one of 'all'"),
     (_with(MINIMAL, "placement.profile", _DELETE), "placement.profile is required"),
@@ -214,6 +215,19 @@ def test_the_mapping_reaches_the_real_parser():
     assert parsed.server_args == "--mem-fraction-static 0.8"
     assert parsed.extra_env == ["A=1", "B=x=y"]
     assert (parsed.no_kernel, parsed.no_framework_agent) == (True, False)
+
+
+@pytest.mark.parametrize(
+    ("options", "asked"),
+    [({"source_changes": False}, True), ({"source_changes": True}, False), ({}, False)],
+    ids=["off", "on", "not-given"],
+)
+def test_a_spec_that_turns_source_changes_off_asks_optimize_for_launch_configuration_only(options, asked):
+    """``--no-source-changes`` alone: the flag turns off the kernel phase and the warm replay itself."""
+    argv = optimize_args(parse_campaign(_with(MINIMAL, "options", options)))
+    assert ("--no-source-changes" in argv) is asked
+    parsed = _build_parser().parse_args(argv)
+    assert (parsed.no_source_changes, parsed.no_kernel, parsed.no_warm_replay) == (asked, asked, asked)
 
 
 def test_a_value_that_looks_like_a_flag_is_bound_to_its_flag():

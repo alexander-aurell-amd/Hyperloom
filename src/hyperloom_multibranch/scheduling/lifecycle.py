@@ -289,6 +289,7 @@ class Session:
             settings.inferencex_commit,
             settings.agentx_early_stop,
             make_before_break=settings.make_before_break,
+            source_changes=settings.source_changes,
         )
 
     def _map_calls(self) -> MapCalls:

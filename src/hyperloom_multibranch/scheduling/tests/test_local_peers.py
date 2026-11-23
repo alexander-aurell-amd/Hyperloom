@@ -533,6 +533,7 @@ async def _peers(
     reference_script: str = "",
     base: BaseLaunch | None = None,
     agent_launch: str = "/launches/agent.json",
+    source_changes: bool = True,
 ) -> AsyncIterator[_Built]:
     """The real peers of a session of ``workload`` on ``host`` in ``tmp_path`` lending ``dev_leases`` dev sandboxes,
     with the wiring their specialist sessions were built on; a branch's worktree, holding no component, is served
@@ -562,6 +563,7 @@ async def _peers(
         reference_script,
         agent_launch=agent_launch,
         inferencex_commit=inferencex_commit,
+        source_changes=source_changes,
     )
     wired: list[SessionWiring] = []
 
@@ -698,6 +700,26 @@ def test_an_agentx_budget_of_half_an_hour_keeps_the_window_s_timeout_and_its_hou
     assert boot_limit_sec(_serving_point(timeout), timeout, 1800) == timeout * BOOT_SHARE, (
         "not halved to the 1800 s budget"
     )
+
+
+@pytest.mark.parametrize("kept", [True, False])
+async def test_the_sessions_source_changes_setting_is_the_one_its_toolbox_accepts_tests_by(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kept: bool
+) -> None:
+    """``run --no-source-changes`` (``RunSettings`` and ``PeerSetup``) reaches the acceptance every test passes."""
+    accepted_by: list[object] = []
+    build = local_hosted.build_local_toolbox
+
+    def recorded(session: object, blackboard: object, acceptance: object, spec: object, **options: object) -> object:
+        accepted_by.append(acceptance.source_changes)  # type: ignore[attr-defined]
+        return build(session, blackboard, acceptance, spec, **options)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(local_hosted, "build_local_toolbox", recorded)
+
+    async with _peers(tmp_path, monkeypatch, WORKLOAD, source_changes=kept):
+        pass
+
+    assert accepted_by == [kept]
 
 
 def _serving_point(timeout_sec: int) -> BenchmarkPoint:

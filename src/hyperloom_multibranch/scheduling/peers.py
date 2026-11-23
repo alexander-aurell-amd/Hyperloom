@@ -93,6 +93,7 @@ class PeerSetup:
     head of its ``main``). ``agentx_early_stop`` is the session's AgentX checkpoint mode (``RunSettings``).
     ``make_before_break`` is the session's ``RunSettings.make_before_break``: whether a hosted toolbox keeps a
     finished test's sandbox until the next test's runs (``HostedOptions.make_before_break``).
+    ``source_changes`` is the session's ``RunSettings.source_changes``, which its toolbox's acceptance is built on.
     """
 
     layout: SessionLayout
@@ -115,6 +116,7 @@ class PeerSetup:
     inferencex_commit: str = ""
     agentx_early_stop: EarlyStopMode = EarlyStopMode.SHADOW
     make_before_break: bool = True
+    source_changes: bool = True
 
 
 PeerFactory = Callable[[PeerSetup], Peers]

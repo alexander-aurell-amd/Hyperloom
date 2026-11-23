@@ -181,7 +181,8 @@ class RunSettings:
     so a resumed session judges as it began. ``make_before_break`` has a hosted session keep a finished test's
     sandbox until the next test's runs, so that the cluster does not give its node to another job between two tests,
     where the grant fits at least three tests at once; it runs one test fewer at once there. Off, every test the grant
-    fits runs at once and each sandbox is closed when its test ends. A session measured on this machine ignores it."""
+    fits runs at once and each sandbox is closed when its test ends. A session measured on this machine ignores it.
+    ``source_changes`` off has its toolbox refuse every test whose recipe holds a patch or a kernel artifact."""
 
     workload: Workload
     max_hours: float
@@ -207,6 +208,7 @@ class RunSettings:
     inferencex_commit: str = ""
     agentx_early_stop: EarlyStopMode = EarlyStopMode.SHADOW
     make_before_break: bool = True
+    source_changes: bool = True
 
 
 def session_early_stop(environ: Mapping[str, str]) -> EarlyStopMode:

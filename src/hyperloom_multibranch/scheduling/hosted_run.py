@@ -12,11 +12,11 @@ the legacy entry validated, a multi-branch session needs ``multibranch.workload`
 ``--autonomous-agent``, ``multibranch.make_before_break`` (``true`` by default) ``--make-before-break`` or
 ``--no-make-before-break``, ``multibranch.agentx_duration_sec`` ``--agentx-duration-sec`` and
 ``multibranch.agentx_objective`` ``--agentx-objective`` (an ``agentx`` workload only), ``multibranch.boot_budget_sec``
-``--boot-budget-sec``, and ``placement.max_parallel_tests`` is ``--max-parallel-tests``, at most what runs at once
-where the session measures. The fields ``run`` has no option for --
-``objective``, ``options``, ``placement.profile`` and ``placement.specialist_capacity`` -- are not read. A spec that
-sets ``launch.server_args`` or ``launch.extra_env`` is refused rather than run without them: a multi-branch session's
-base launch, its flags and its environment, is the shell script ``multibranch.reference_script`` names.
+``--boot-budget-sec``, ``options.source_changes`` ``false`` ``--no-source-changes``, and
+``placement.max_parallel_tests`` is ``--max-parallel-tests``, at most what runs at once where the session measures.
+``objective``, the other ``options``, ``placement.profile`` and ``placement.specialist_capacity`` are not read. A spec
+that sets ``launch.server_args`` or ``launch.extra_env`` is refused rather than run without them: a multi-branch
+session's base launch, its flags and its environment, is the shell script ``multibranch.reference_script`` names.
 
 With ``placement.measurement`` ``hosted`` (the default), every test, PRELUDE's included, runs in a measurement sandbox
 of the grant, so the application's container needs no card: ``hosted-cpu`` serves as ``hosted-gpu`` does. Dev
@@ -176,7 +176,6 @@ def run_argv(spec: CampaignSpec, max_hours: float, parallel_tests: int) -> list[
 
     section = _multibranch_section(spec.multibranch)
     _refuse_launch_fields(spec)
-    _refuse_launch_config_only(spec)
     values: dict[str, Any] = {
         "model": spec.model_path,
         "framework": spec.framework_name,
@@ -206,7 +205,7 @@ def run_argv(spec: CampaignSpec, max_hours: float, parallel_tests: int) -> list[
         "boot-budget-sec": _whole_seconds(section, "boot_budget_sec"),
     }
     agents = [f"--autonomous-agent={source}" for source in _agent_sources(section.get("autonomous_agents"))]
-    switches = _switches(section)
+    switches = _switches(spec, section)
     return [
         "run",
         *(f"--{option}={value}" for option, value in values.items() if value is not None),
@@ -244,12 +243,13 @@ def _whole_seconds(section: Mapping[str, Any], field: str) -> int | None:
     return seconds
 
 
-def _switches(section: Mapping[str, Any]) -> list[str]:
-    """The on/off options of ``section``: ``multibranch.make_before_break`` as ``--[no-]make-before-break``, nothing
-    when the spec leaves it to ``run``'s default (on)."""
+def _switches(spec: CampaignSpec, section: Mapping[str, Any]) -> list[str]:
+    """The on/off options of ``spec``: ``multibranch.make_before_break`` as ``--[no-]make-before-break``, nothing
+    when left to ``run``'s default (on), and ``options.source_changes`` ``false`` as ``--no-source-changes``."""
 
     keep = _make_before_break(section)
-    return [] if keep is None else ["--make-before-break" if keep else "--no-make-before-break"]
+    switches = [] if keep is None else ["--make-before-break" if keep else "--no-make-before-break"]
+    return [*switches, "--no-source-changes"] if spec.source_changes is False else switches
 
 
 def spec_make_before_break(spec: CampaignSpec) -> bool:
@@ -290,14 +290,6 @@ def _refuse_launch_fields(spec: CampaignSpec) -> None:
             f"a multibranch run does not read {' or '.join(given)}: give the base launch as"
             " multibranch.reference_script, a shell launch script whose 'export NAME=value' lines set its environment"
             " and whose server command carries its flags"
-        )
-
-
-def _refuse_launch_config_only(spec: CampaignSpec) -> None:
-    if spec.source_changes is False:
-        raise HostedRefused(
-            "a multibranch run does not read options.source_changes: its branches keep source changes, so it cannot"
-            " hold a session to server arguments and environment variables; use flow 'single' for that"
         )
 
 

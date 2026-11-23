@@ -69,7 +69,7 @@
         "framework_agent": {"type": "boolean"},
         "source_changes": {
           "type": "boolean",
-          "description": "false keeps the run to server arguments and environment variables (--no-source-changes), which also turns off the kernel phase and the warm replay. Flow 'multibranch' refuses it."
+          "description": "false keeps the run to server arguments and environment variables (--no-source-changes). Flow 'single' also turns off the kernel phase and the warm replay with it; flow 'multibranch' refuses every test whose recipe holds a patch or a kernel artifact, and takes no multibranch.autonomous_agents with it."
         },
         "eval": {"const": true, "description": "The accuracy eval cannot be turned off; false is refused."},
         "enablement": {"enum": ["all", "launch", "eval", "off"]}

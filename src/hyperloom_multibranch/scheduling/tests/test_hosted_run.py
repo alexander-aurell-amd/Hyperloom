@@ -156,6 +156,13 @@ def test_a_reference_script_that_is_no_path_is_refused_naming_the_field(path: ob
         run_argv(spec, 1.0, 1)
 
 
+def test_a_spec_that_turns_source_changes_off_is_refused_pointing_at_the_single_flow() -> None:
+    spec = _spec("hosted", options={"source_changes": False})
+
+    with pytest.raises(HostedRefused, match="does not read options.source_changes: .* use flow 'single'"):
+        run_argv(spec, 1.0, 1)
+
+
 @pytest.mark.parametrize(
     ("launch", "named"),
     [

@@ -6,7 +6,8 @@
 The role says how a long-running specialist works through the session's tools, the base launch every recipe changes,
 what has found gains on ROCm before, how its candidates are judged, how it
 declares a correctness fix with its repro case, and which gains the toolbox refuses as fake (main's ``FAKE_GAINS``
-catalog, so a new row reaches the role). The
+catalog, so a new row reaches the role); in a session that keeps launch configuration only it ends by saying so, and
+that this overrides what it says of source work before. The
 launch prompt opens, on a branch log longer than it shows, with a summary of what was tried, its results and the
 latest plan; then the repair a repair branch was opened for, the branch's direction (one the user wrote, or the
 session's) and the startup brief; then the branch, its head, K and the branch's latest memory, so a new session goes
@@ -34,6 +35,7 @@ from hyperloom_multibranch.contracts.branch_log import BranchLogType
 from hyperloom_multibranch.contracts.fork import RepairRequest
 from hyperloom_multibranch.contracts.blackboard.records import BranchLogRecord, InboxItem
 from hyperloom_multibranch.contracts.sources import NativeTree
+from hyperloom_multibranch.contracts.toolbox import LAUNCH_CONFIG_ONLY_CODE
 from hyperloom_multibranch.rulegate.agentx import AgentXObjective
 from hyperloom_multibranch.rulegate.fix_case import CASE_SCRIPT
 from hyperloom_multibranch.specialist.directions import DIRECTIONS, direction_name
@@ -509,11 +511,13 @@ def _agentx_grading(objective: AgentXObjective) -> _Grading:
 
 @dataclass(frozen=True)
 class RoleWorkload:
-    """What a session optimizes, as its specialists' role tells it: the workload in words, and the objective of an
-    AgentX session (none: an InferenceX one)."""
+    """What a session optimizes, as its specialists' role tells it: the workload in words, the objective of an
+    AgentX session (none: an InferenceX one), and whether the session keeps source changes (off: the role ends with
+    :data:`_LAUNCH_CONFIG_ONLY`)."""
 
     named: str
     agentx: AgentXObjective | None = None
+    source_changes: bool = True
 
     @property
     def grading(self) -> _Grading:
@@ -544,7 +548,34 @@ def role_prompt(
         gpu_rule=gpu_rule,
         **asdict(workload.grading),
     )
-    return role + _native(native or {}) + _references(references or {}) + _base(base)
+    kept = "" if workload.source_changes else _LAUNCH_CONFIG_ONLY
+    return role + _native(native or {}) + _references(references or {}) + _base(base) + kept
+
+
+_LAUNCH_CONFIG_ONLY = f"""
+Launch configuration only. This session was started with --no-source-changes: the recipe it hands on goes where no \
+patch and no kernel file can follow, so it may hold nothing but server arguments and environment variables. This \
+overrides everything above, and every direction, brief and runtime message, that tells you to change code:
+- The toolbox refuses, as {LAUNCH_CONFIG_ONLY_CODE}, every test whose recipe holds a patch or a kernel artifact, \
+whoever submits it. A patch, a fused or rewritten kernel, a tuned table, a port of a PR and a Forge run can never \
+land here: spend nothing of your branch on one, and start no kernel_tune.
+- Claim config intents only, and submit deltas that change only config.
+- Your direction and the brief's focus still say where the time goes: answer them with settings. Read the code on \
+the top operator's path, server.log and the profile for the flags and environment variables that path reads (a \
+backend or kernel family switch, a fused path or a feature the engine leaves off, a scheduler or cache setting, a \
+model feature set with --hf-overrides), and test those. Where a direction says to write a patch or a kernel, take the \
+question it asks (which operator, which path) and look for the setting that moves it.
+- A "left out:" patch or kernel of a replayed champion stays out: read a patch for the settings it relies on, never \
+to port it.
+- A setting that names a file you wrote (a table, a module on PYTHONPATH, a template) carries that file, which the \
+recipe cannot hold: do not test it.
+- The messages that say source work does not run out, or to test the next source change, are written for a session \
+that keeps source changes: here, test the next setting.
+- When your direction has no setting left to test on your head, take another; the one you leave, once you tested it, \
+you record EXHAUSTED with why all_tested_or_claimed and reopen_if "the session keeps source changes". When no \
+direction has one, say so in your branch log and end your turn: your branch then stops, and a session that has tested \
+its settings ends early, which is its result.
+"""
 
 
 _NATIVE = """
@@ -744,7 +775,7 @@ def prompt_versions() -> dict[str, str]:
         **asdict(_INFERENCEX_GRADING),
     )
     agentx = (text for objective in AgentXObjective for text in astuple(_agentx_grading(objective)))
-    settings = (_DEV_SANDBOX, _NATIVE, _REFERENCES, _BASE, *_HOLDS.values(), *agentx)
+    settings = (_DEV_SANDBOX, _NATIVE, _REFERENCES, _BASE, _LAUNCH_CONFIG_ONLY, *_HOLDS.values(), *agentx)
     texts = {
         "specialist_role": "\n".join((role, *settings)),
         "specialist_launch": "\n".join((*_LAUNCH, _LEASE_WAKE, _WAIT_WAKE)),

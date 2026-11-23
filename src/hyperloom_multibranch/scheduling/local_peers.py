@@ -490,7 +490,7 @@ def _specialist_briefs(setup: PeerSetup, repo: GitExperimentRepo) -> SessionBrie
         learnings=learnings,
         repo=repo,
         stack_slot=repo.stack_kernel_slot,
-        menus=session_menus(setup.workload.metric, setup.layout.reports),
+        menus=session_menus(setup.workload.metric, setup.layout.reports, setup.source_changes),
         cases=CasePool.from_env(),
     )
 
@@ -739,7 +739,9 @@ def model_backed_sessions(command: AgentCommand) -> SpecialistSessions:
             command=command,
             role=role_prompt(
                 RoleWorkload(
-                    _specialist_role(workload), workload.agentx_objective if workload.inferencex is None else None
+                    _specialist_role(workload),
+                    workload.agentx_objective if workload.inferencex is None else None,
+                    wiring.setup.source_changes,
                 ),
                 references=wiring.setup.references,
                 base=wiring.base,

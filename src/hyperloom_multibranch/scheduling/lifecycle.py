@@ -315,7 +315,9 @@ class Session:
         """PRELUDE on the peers' repository, gate and toolbox: it opens the integration branch, replays the champion
         recipe on it and profiles the root, warm-started from the Recipe KB when the session has one."""
 
-        warm_start = None if services.recipe_kb is None else WarmStartSource(services.recipe_kb, self._blobs)
+        warm_start = None
+        if services.recipe_kb is not None:
+            warm_start = WarmStartSource(services.recipe_kb, self._blobs, self._settings.source_changes)
         prelude_services = PreludeServices(
             peers.repo,
             peers.gate,

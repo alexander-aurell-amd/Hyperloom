@@ -133,7 +133,7 @@ from hyperloom_multibranch.scheduling.exports import ARCHIVED_BEFORE
 from hyperloom_multibranch.scheduling.final import INTEGRATION_LABEL, PRIMARY_POINT_ONLY
 from hyperloom_multibranch.scheduling import judge
 from hyperloom_multibranch.scheduling.judge import GRACE_KEY, HoldReason
-from hyperloom_multibranch.scheduling.judge_prompt import JUDGE_PROMPT_VERSION
+from hyperloom_multibranch.scheduling.judge_prompt import JUDGE_PROMPT_VERSION, LAUNCH_CONFIG_ONLY
 from hyperloom_multibranch.scheduling.integrator import ADOPTING_LEAD, EXPLORATION_ENDED
 from hyperloom_multibranch.scheduling.launch_isolation import LaunchIsolation
 from hyperloom_multibranch.scheduling.hosted_run import prelude_landed
@@ -1067,6 +1067,19 @@ async def test_a_setting_of_the_run_reaches_the_peers(tmp_path: Path, name: str,
     stage._session()
 
     assert getattr(stage.setup, name) == value
+
+
+@pytest.mark.parametrize("kept", [True, False], ids=["source-changes-kept", "launch-configuration-only"])
+async def test_the_judge_of_a_session_held_to_launch_configuration_is_told_so_at_every_call(
+    tmp_path: Path, kept: bool
+) -> None:
+    stage = _stage(tmp_path)
+    stage.settings = replace(stage.settings, source_changes=kept)
+
+    await stage.run()
+
+    prompts = _judge_prompts(stage)
+    assert prompts and all((LAUNCH_CONFIG_ONLY in prompt) is not kept for prompt in prompts)
 
 
 @pytest.mark.parametrize(("review_gate", "handed"), [(True, "host"), (False, "off")])

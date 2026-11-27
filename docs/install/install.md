@@ -43,7 +43,7 @@ Before installing Hyperloom, ensure the following requirements are met.
 From the agent terminal in that workspace, install the published release wheel:
 
 ```bash
-pip install hyperloom-inference-optimizer==1.1.5 --target .
+pip install hyperloom-inference-optimizer==1.2.0 --target .
 ```
 
 It is normal for the current directory to contain many Python package directories
@@ -417,15 +417,18 @@ set of accepted shapes, including split entrypoints and self-hosted gateways.
 ### Use the DeepSeek Harness
 
 The DeepSeek Harness (`dsh`) is a third agent backend beside Claude and Codex.
-It is not in a published release yet (the latest wheel, 1.1.5, has neither the
-`deepseek` extra nor the harness code), so it needs a source checkout. Hyperloom
-never picks it automatically, and the setup skill does not configure it. To run
-on it:
+The 1.2.0 wheel has the `deepseek` extra, but its harness route rejects the
+`redacted_thinking` blocks a gateway such as the AMD one returns, so a turn that
+receives one fails; the route that keeps them is on `main` and not yet in a
+release, so use a source checkout. Hyperloom never picks the harness
+automatically, and the setup skill does not configure it. To run on it:
 
 1. From the repository root, install the `deepseek` extra:
    `pip install -e '.[deepseek]'`.
-2. Set `OPENAI_BASE_URL` and `OPENAI_API_KEY` to an OpenAI-protocol gateway that
-   serves the model.
+2. Set `OPENAI_BASE_URL` and `OPENAI_API_KEY` to the gateway that serves the
+   model. The harness speaks the Anthropic Messages protocol to it: it drops a
+   trailing `/v1` from `OPENAI_BASE_URL` and posts to `<root>/v1/messages`, so
+   the gateway must answer Anthropic Messages requests there.
 3. Set `INFERENCE_OPTIMIZER_AGENT_BACKEND=deepseek`, and `DSH_MODEL` to the model
    id the gateway serves.
 
@@ -471,8 +474,8 @@ framework, so nothing needs to be installed inside the container beyond
 Hyperloom's runtime deps. The following images are recommended:
 
 - `vllm`: `docker.io/vllm/vllm-openai-rocm:v0.34.0-rocm100`
-- `sglang` MI300X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi30x-20261118`
-- `sglang` MI355X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261118`
+- `sglang` MI300X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi30x-20261111`
+- `sglang` MI355X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111`
 
 Start a long-running container from the repo root, mounting it at the same path
 so `.env`, logs, and session artifacts stay valid:

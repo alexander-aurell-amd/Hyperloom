@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -233,6 +235,16 @@ def test_section_renders_none_when_evidence_empty():
     assert "(none" in text
 
 
+def test_section_promises_no_snapshot_of_a_framework_that_runs_under_no_torch_profiler():
+    """No roofline is ever enqueued for such a framework, so the section must not say one is in flight."""
+    text = " ".join(roofline_evidence_section(replace(_make_inp({}), framework="llamacpp")))
+    assert "no torch profiler" in text and "auto-enqueues" not in text
+
+    for profiled in ("sglang", ""):
+        text = " ".join(roofline_evidence_section(replace(_make_inp({}), framework=profiled)))
+        assert "auto-enqueues" in text and "no torch profiler" not in text
+
+
 @pytest.mark.parametrize(
     ("report", "label"),
     [("/sd/analysis.md", "Full analysis.md path"), ("/sd/analysis.json", "Full TraceLens report path")],
@@ -256,3 +268,43 @@ def test_build_specialist_prompts_inserts_section_between_kb_and_recipe():
     roof_idx = user.index("## 4a. ROOFLINE EVIDENCE")
     recipe_idx = user.index("## 5. WARM-START RECIPE SUMMARY")
     assert kb_idx < roof_idx < recipe_idx
+
+
+@pytest.mark.asyncio
+async def test_recorded_system_findings_reach_the_coordinator_digest_and_the_specialist_section(tmp_path):
+    """A finding whose table TraceLens could not read back has no share row; it is listed, not a crash."""
+    comm = {
+        "operation": "Exposed Collective Communication",
+        "node": None,
+        "members": [{"metric": "Exposed Communication %", "value": 60.72, "unit": "%"}],
+        "impact": None,
+        "resolution": "Overlap the all-gather with compute.",
+        "priority": 1,
+    }
+    off_contract = {"operation": "H2D memcpy hygiene check", "node": None, "members": [], "priority": 2}
+    analysis_md = tmp_path / "analysis.md"
+    analysis_md.write_text("# Executive Summary\n", encoding="utf-8")
+    (tmp_path / "analysis.json").write_text(
+        json.dumps({"system_optimizations": [comm, off_contract]}), encoding="utf-8"
+    )
+    state = SharedState()
+    state.record_trace_analyze(
+        {"trace_input": str(tmp_path / "trace.json")},
+        {"hot_kernels": [], "trace_report_path": str(analysis_md), "trace_health_warnings": []},
+    )
+    lines = [
+        "P1 Exposed Collective Communication  Exposed Communication %: 60.72%",
+        "P2 H2D memcpy hygiene check  share: n/a",
+    ]
+
+    digest = state.to_prompt_summary()
+    assert all(f"  {line}" in digest for line in lines)
+
+    params: dict[str, Any] = {"domain": "serving_specialist"}
+    await _make_coord(tmp_path, state=state).specialist_dispatch.warm_specialist_params(params)
+    section = roofline_evidence_section(_make_inp(params["roofline_evidence"]))
+    assert all(f"- {line}" in section for line in lines)
+
+    state.last_trace_analyze["system_findings"] = []
+    assert "system_findings:" not in state.to_prompt_summary()
+    assert not any("System bottlenecks" in row for row in roofline_evidence_section(_make_inp({"system_findings": []})))

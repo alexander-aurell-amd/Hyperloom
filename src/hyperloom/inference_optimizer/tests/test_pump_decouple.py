@@ -42,8 +42,8 @@ class _Instant(_Gated):
 def coord(tmp_path: Path):
     from hyperloom.orchestrator.loop.coordinator import AdvisoryServices, Coordinator
     from hyperloom.orchestrator.roles.agent_role import default_role_registry
-    from hyperloom.orchestrator.roles.mock_backend import MockBackend, MockTurn, ScriptedPlan
     from hyperloom.orchestrator.state.shared_state import SharedState
+    from hyperloom.orchestrator.tests.mock_backend import MockBackend, MockTurn, ScriptedPlan
 
     state = SharedState(session_id="decouple-test")
     # Room for a patch specialist's 60-minute admission floor.
@@ -155,30 +155,6 @@ async def test_frozen_admission_spawns_nothing(coord):
     await asyncio.wait_for(coord.dispatcher.pump_dispatcher_once(), timeout=5)
     await _settle(coord)
     assert fast.calls
-
-
-async def test_spawning_a_specialist_resets_its_domain_stale_counter(coord):
-    from hyperloom.orchestrator.specialists.domains import get_domain
-
-    specialist = _Gated()
-    coord.sub.register_executor("specialist", specialist)
-    anchor = get_domain("serving_specialist").kb_anchor
-    for _ in range(5):
-        coord.shared_state.bump_domain_round_counters()
-    await _enqueue(
-        coord,
-        "specialist",
-        "cpu-spec",
-        ["research_lane"],
-        {"domain": "serving_specialist", "gap_canonical_id": "gap.test"},
-    )
-
-    await asyncio.wait_for(coord.dispatcher.pump_dispatcher_once(), timeout=5)
-    assert coord.shared_state.rounds_since_last_specialist[anchor] == 0
-
-    specialist.gate.set()
-    await _settle(coord)
-    assert specialist.calls
 
 
 async def test_waiting_for_running_work_returns_when_an_action_finishes(coord):

@@ -114,6 +114,8 @@ class SessionContext:
     Attributes:
         framework: ``sglang`` / ``vllm`` -- printed in SESSION CONTEXT.
         framework_agent_phase_enabled: When False (``--no-framework-agent``) the FRAMEWORK_AGENT phase is skipped.
+        no_source_changes: ``--no-source-changes``: integrate_patch keeps only server arguments and environment
+            variables, so the phase contract says not to ask for patches.
         objective_kind: Objective kind string, printed verbatim.
         objective_value: Objective target value, printed verbatim.
         max_minutes: Wall-clock budget for the run, in minutes.
@@ -130,6 +132,7 @@ class SessionContext:
 
     framework: str = "sglang"
     framework_agent_phase_enabled: bool = True
+    no_source_changes: bool = False
     objective_kind: str = "time_only"
     objective_value: float | str | None = None
     max_minutes: int = 0
@@ -149,17 +152,13 @@ class PromptCycle:
     Attributes:
         macro_cycle: Current macro-cycle counter; shown in the CYCLE DIRECTIVE section.
         cycle_directive: Optional LLM-authored focus text for this cycle (from
-            ``orchestration_memory.next_cycle_directive``); empty with no ``cycle_strategy`` renders the standing
-            breadth->depth default.
-        cycle_strategy: Optional dict from ``plan_cycle_focus`` with deterministic focus, rationale, saturated
-            directions, and prior-cycle history; rendered in the CYCLE DIRECTIVE section after the LLM directive.
+            ``orchestration_memory.next_cycle_directive``); empty renders the standing breadth->depth default.
         phase: Current pipeline phase; omits the modules whose behaviour it cannot reach. Empty renders every
             module. The Coordinator rebuilds the prompt at each phase seam.
     """
 
     macro_cycle: int = 0
     cycle_directive: str = ""
-    cycle_strategy: Mapping[str, Any] | None = None
     phase: str = ""
 
 
@@ -213,9 +212,8 @@ def _section_session_context(session: SessionContext, *, kernel_enabled: bool) -
         "",
         "The Coordinator supplies the session context (resource pools,",
         "constraints, advisories) first, then the per-tick blocks (Phase,",
-        "Mission progress, Time budget, Tick, Shared session state, recent",
-        "policy denials, Untested proposals, KB hints, Plateau advisory,",
-        "inbox tail) every tick.",
+        "Mission progress, Time budget, Tick, Shared session state,",
+        "Untested proposals, KB hints, Plateau advisory, inbox tail) every tick.",
         "The Time-budget block carries `remaining=X.Xmin`.",
         "See PHASE CONTRACT below for the phase chain, per-phase allowed",
         "actions, and phase-transition rules.",
@@ -223,10 +221,26 @@ def _section_session_context(session: SessionContext, *, kernel_enabled: bool) -
     return lines
 
 
+_NO_SOURCE_CHANGES_CONTRACT: tuple[str, ...] = (
+    "LAUNCH CONFIGURATION ONLY (--no-source-changes): this run keeps nothing but",
+    "server arguments and environment variables. `integrate_patch` skips any",
+    "round that carries a patch, an upstream PR, a tuned artifact, a rewrite",
+    "switch, setup commands or another runtime (`skipped_reason=no_source_changes`).",
+    "A setting whose value names a file under the session directory is such a",
+    "change: that round is skipped, and an `explore` with such a variant is denied.",
+    "Dispatch specialists for configuration proposals and research, never with",
+    "`mode='patch'` to author a source change. This overrides the **Config vs",
+    "source patch** guidance below: after config-only rounds, search the",
+    "configuration space further instead of switching to patches.",
+    "",
+)
+
+
 def _section_phase_semantics(
     *,
     kernel_enabled: bool,
     framework_agent_phase_enabled: bool = True,
+    no_source_changes: bool = False,
 ) -> list[str]:
     """Render the per-phase LLM-proposable action contract (current phase
     injected dynamically by the Coordinator).
@@ -239,6 +253,7 @@ def _section_phase_semantics(
     Args:
         kernel_enabled: Whether kernel_agent-owned actions are enabled.
         framework_agent_phase_enabled: Whether the FRAMEWORK_AGENT phase is enabled.
+        no_source_changes: Whether ``--no-source-changes`` keeps the run to launch configuration.
 
     Returns:
         Markdown lines for the phase-contract section.
@@ -264,6 +279,8 @@ def _section_phase_semantics(
         skipped = ", ".join(f"{ph} ({flag})" for ph, flag in disabled_suffix.items())
         lines.append(f"Phases SKIPPED this run (never entered): {skipped}.")
         lines.append("")
+    if no_source_changes:
+        lines.extend(_NO_SOURCE_CHANGES_CONTRACT)
     lines.extend(
         render_phase_action_bullets(
             disabled_suffix=disabled_suffix,
@@ -274,7 +291,7 @@ def _section_phase_semantics(
             "",
             f"{', '.join(sorted(COORDINATOR_INTERNAL_ACTIONS))} are never in the",
             "sets above: the Coordinator dispatches them and PolicyGate denies",
-            "any attempt to propose them (`coordinator_managed_action`). Denial",
+            "any attempt to propose them (`phase_incompatible`). Denial",
             "of any action lands in your inbox as a `policy_denied` event.",
             "",
             "Phase transitions are Coordinator-owned. The hard advance gates",
@@ -282,13 +299,14 @@ def _section_phase_semantics(
             "exits ENABLEMENT and `baseline_tput > 0` exits PRELUDE, each after",
             "the initial roofline it enqueued completes (the Phase block's `hold` line);",
             "the per-phase budget cap or a terminal stop_reason exits FRAMEWORK_AGENT",
-            "/ KERNEL_AGENT / SWEEP; the wall-clock deadline (closing phase) routes to CLOSE.",
+            "/ KERNEL_AGENT; CYCLE_END exits once its entry work settles the cycle, it has",
+            "no budget share; the wall-clock deadline (closing phase) routes to CLOSE.",
             "You may also emit `escalate_strategy_change{next_action_hint=",
             "'skip_to_kernel'}` in FRAMEWORK_AGENT when you judge",
             "the current phase exhausted; the Coordinator validates the hint",
             "vocab and routes the transition on the next tick. No hint ends the",
             "run: the Coordinator prices the remaining budget itself and exits",
-            "with an honest terminal stop_reason (`sweep_done` /",
+            "with an honest terminal stop_reason (`cycle_end_done` /",
             "`global_converged` / `time_exhausted`) once a further cycle cannot",
             "be funded.",
         ]
@@ -475,7 +493,8 @@ def _format_grid_injection_hint(name: str) -> str | None:
             "Variants run serially; a KEEP is graded on its decision "
             "round. A row that starts the stack's own server (see "
             "`current_launch_flags`) is skipped, and rows starting the same server "
-            "are benched once; any prior fingerprint may be re-proposed. "
+            "are benched once; any prior fingerprint may be re-proposed, except one carrying a change the "
+            "framework refused at start on a configuration error (skipped as `known_dead_change`). "
             "Use remove_args/unset_envs to ablate harmful base flags; "
             "args_mode='replace' to drop inherited server args. "
             "Every variant requires action-time reasoning that names the "
@@ -704,8 +723,9 @@ def _failure_recovery_lines(*, phase: str, transport: str = "") -> list[str]:
             "* **RULE F2** — repeated `error_class='subprocess_nonzero'` or `'client_failed'`"
             " on `baseline` → stop retrying baseline;"
             " send observation 'blocked: …' quoting the failure excerpt."
-            " Explore variants may be re-proposed; read the failure log first.",
-            "* **RULE F3** — `policy_denial_streak` is information only."
+            " Explore variants may be re-proposed, except one carrying a change the framework refused at start"
+            " on a configuration error (`known_dead_change`); read the failure log first.",
+            "* **RULE F3** — a `policy_denied` event names the rule that refused the intent."
             " Change something substantive; re-emitting the identical intent wastes a tick.",
         ]
     )
@@ -735,7 +755,9 @@ def _idea_generation_lines() -> list[str]:
         "3. **Re-examine rejects** — per `explore_search.rejected` variant, judge",
         "   whether the failure is stale, fixable, or ruled out; re-propose the",
         "   same config to revalidate or change the value (a `-2%` reject is a",
-        "   dead flag; `-0.3%` may clear the bar once patched).",
+        "   dead flag; `-0.3%` may clear the bar once patched). A config the",
+        "   framework refused at start on a configuration error is skipped as",
+        "   `known_dead_change`: change the dead setting instead of re-proposing it.",
         "4. **Ablate harmful base config** — when a user/base flag or env may",
         "   be slowing the workload, emit a variant with `remove_args` and/or",
         "   `unset_envs` instead of only adding more knobs.",
@@ -764,7 +786,7 @@ Read the optimization lane's outcome before you act: a `state.gaps[]`
 `layer='kernel_agent'` gap names the target, `pending_keep_kernels` lists the
 KEEPs awaiting integrate, `rejected_kernel_ids` lists the ids already written
 off, and `last_action_failures` explains a request of your own that failed.
-KERNEL_AGENT → SWEEP advance is driven by the phase budget, idle-no-progress,
+KERNEL_AGENT → CYCLE_END advance is driven by the phase budget, idle-no-progress,
 agent settled with no pending kernel work, or a terminal stop_reason.
 
 ### `trace_analyze` — read-only candidate analysis
@@ -891,13 +913,11 @@ def _section_cycle_directive(
     *,
     macro_cycle: int = 0,
     cycle_directive: str = "",
-    cycle_strategy: Mapping[str, Any] | None = None,
 ) -> list[str]:
     """Build the CYCLE DIRECTIVE section.
 
-    Renders the LLM-authored ``cycle_directive`` when present, the deterministic
-    ``cycle_strategy`` focus/history when provided, or the breadth→depth default
-    when neither is set.
+    Renders the LLM-authored ``cycle_directive`` when present, else the
+    breadth→depth default.
 
     Returns:
         list[str]: Markdown lines for the section.
@@ -914,7 +934,7 @@ def _section_cycle_directive(
     if cycle_directive and cycle_directive.strip():
         lines.append("Focus for this cycle (LLM-authored at prior cycle boundary):")
         lines.append(cycle_directive.strip())
-    elif not cycle_strategy:
+    else:
         lines.extend(
             [
                 "Default arc (no per-cycle directive yet):",
@@ -925,26 +945,6 @@ def _section_cycle_directive(
                 "  work that needs a long measure→edit→measure loop.",
             ]
         )
-    if cycle_strategy:
-        focus = str(cycle_strategy.get("focus") or "").strip()
-        score = cycle_strategy.get("score")
-        rationale = str(cycle_strategy.get("rationale") or "").strip()
-        saturated = cycle_strategy.get("saturated_at_start") or []
-        prior_cycles: list[Any] = list(cycle_strategy.get("prior_cycles") or [])
-        lines.append("")
-        lines.append(f"Deterministic focus: focus={focus} score={score}")
-        if rationale:
-            lines.append(f"rationale: {rationale}")
-        if saturated:
-            lines.append(f"saturated_at_start={list(saturated)}")
-        if prior_cycles:
-            lines.append("previous cycles:")
-            for row in prior_cycles[-5:]:
-                lines.append(
-                    f"  - cycle={row.get('cycle')} focus={row.get('focus')} "
-                    f"gain_delta={row.get('gain_delta')} saturated={row.get('saturated_at_start') or []}"
-                )
-        lines.append("Advisory only: use this as a prior, not a dispatch gate.")
     return lines
 
 
@@ -1064,12 +1064,11 @@ def build_orchestration_prompt(
         _section_phase_semantics(
             kernel_enabled=kernel_enabled,
             framework_agent_phase_enabled=session.framework_agent_phase_enabled,
+            no_source_changes=session.no_source_changes,
         ),
         _section_action_catalogue(actions),
         _section_decision_framework(phase=phase_norm, transport=transport),
-        _section_cycle_directive(
-            macro_cycle=cycle.macro_cycle, cycle_directive=cycle.cycle_directive, cycle_strategy=cycle.cycle_strategy
-        ),
+        _section_cycle_directive(macro_cycle=cycle.macro_cycle, cycle_directive=cycle.cycle_directive),
     ]
     if (
         kernel_enabled

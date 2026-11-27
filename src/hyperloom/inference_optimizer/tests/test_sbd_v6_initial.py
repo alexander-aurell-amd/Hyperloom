@@ -749,7 +749,6 @@ def _stub_preflight_steps(tmp_path, monkeypatch):
     monkeypatch.setattr(preflight, "_check_gpu_visibility", lambda: None)
     monkeypatch.setattr(preflight, "_check_shm_disk", lambda: None)
     monkeypatch.setattr(preflight, "_check_platform_tuning", lambda: None)
-    monkeypatch.setattr(preflight, "_ensure_ray", lambda *_args: None)
     monkeypatch.setattr(preflight, "_ensure_bench_serving_deps", lambda *_args: None)
     monkeypatch.setattr(preflight, "_check_serving_framework", lambda *_args: None)
     monkeypatch.setattr(preflight, "_check_agent_cli", lambda: None)
@@ -793,7 +792,6 @@ def test_preflight_records_install_steps_in_execution_order(tmp_path, monkeypatc
         "check_gpu_visibility",
         "check_shm_disk",
         "check_platform_tuning",
-        "ensure_ray",
         "ensure_bench_serving_deps",
         "check_serving_framework",
         "check_kernel_tuning_clis",
@@ -893,12 +891,12 @@ def test_each_model_gate_failure_is_written_to_final_sbd(
             },
         )
     elif scenario == "config":
-        _write_model_config(
-            model,
+        _write_json(
+            model / "config.json",
             {
                 "architectures": ["LlamaForCausalLM"],
                 "model_type": "llama",
-                "rope_scaling": {"factor": 2.0},
+                "max_position_embeddings": 2048,
             },
         )
     else:

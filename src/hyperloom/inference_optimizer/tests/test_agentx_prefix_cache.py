@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 
 from hyperloom.common.launch_log_evidence import observed_server_config_from_log
-from hyperloom.orchestrator.actions.executors import _agentx_prefix_cache as pc
+from hyperloom.orchestrator.actions.executors.workload import _agentx_prefix_cache as pc
 from hyperloom.orchestrator.actions.executors.baseline import BaselineExecutor
 from hyperloom.orchestrator.state.shared_state import SharedState
 
@@ -143,7 +143,7 @@ def _run_baseline(
     async def _measured_round(ctx, *, recorder=None):
         return result
 
-    executor._run_retrying = _measured_round
+    executor._run_with_accuracy = _measured_round
     task = SimpleNamespace(task_id="t-bl", kind=kind, params={"framework": "sglang", **(params or {})})
     ctx = SimpleNamespace(task=task, extra={"shared_state": state})
     return asyncio.run(executor._run(ctx)), state

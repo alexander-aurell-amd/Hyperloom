@@ -322,7 +322,7 @@ in [Step 1](#step-1--install-one-time-per-pod--venv-rebuild). CLI preflight read
 the regenerated `kernel-agent.env.sh` in-process, from the place `install.sh`
 selected (`assets/runtime_env.sh` decides it for both); the launch shell must not
 source it. Skipping install can leave
-TraceLens/GEAK unavailable or Ray unprepared. A missing runtime env fails
+TraceLens/GEAK unavailable. A missing runtime env fails
 preflight before optimization. `install.sh --check-only` is a *diagnostic*,
 never a substitute.
 
@@ -402,11 +402,11 @@ brief:
   denies any delegate naming it as domain or tag. With `HYPERLOOM_CUSTOM_SPECIALIST_ONLY=1`
   FRAMEWORK_AGENT runs nothing else: Orchestration takes no turn there (its
   specialists, grids and patches would be denied), the custom task may run to
-  the phase end with no lease extension, the Coordinator's own discovery, scout, stalled-
-  domain force, predictor and general bench are skipped, and the phase hints
+  the phase end with no lease extension, the Coordinator's own discovery, scout,
+  predictor and general bench are skipped, and the phase hints
   `skip_to_sweep` once the custom task (or its refused admission), its grid and
   its patch reviews are done; the exit goes to KERNEL_AGENT when that phase is
-  enabled, else SWEEP, and later phases run as usual.
+  enabled, else CYCLE_END, and later phases run as usual.
 - **PrimaTune predictor rows**: with `--primatune-endpoint` and
   `--primatune-mode active`, the predictor's proposals lead the untested-proposal
   block. Orchestration copies the ones worth a slot into its next `explore` grid
@@ -561,7 +561,6 @@ of `src/hyperloom/inference_optimizer/assets/install.sh`):
 
 | Component | Provided by |
 |---|---|
-| `ray==2.44.1`, or the lowest published version above it that has a wheel for this interpreter; `RAY_VERSION` is honoured verbatim. The install is certified by Ray's own parser accepting the `ray start` argv Hyperloom passes (`RAY_START_ARGV`). `click` changes in one case only: when Ray 2.44.1's CLI fails to import under `click` 8.3+ (`is not a valid Sentinel`), the installer and preflight hold `click<8.3` once and certify again; nothing else changes `click` | pip |
 | TraceLens public (editable install) | `ensure_tracelens` (`pip install -e` at `$TRACELENS_ROOT`; skills, patches, CLI, analysis orchestrator) |
 | TraceLens-internal (editable install, **optional**) | `ensure_tracelens` (`pip install -e` at `$TRACELENS_INTERNAL_ROOT` only when set; mirrors read-only checkout to `${HYPERLOOM_ROOT}/TraceLens-internal`; rehydration module). Unset => open-source-only. |
 | GEAKv4 Claude Code workflow checkout + SDK deps | `ensure_geak` |
@@ -748,8 +747,8 @@ when the file is absent, invalid, or stale.
 ```bash
 python3 -m hyperloom optimize \
   --model "$MODEL_PATH" \
-  --framework vllm \           # sglang (default) / vllm / atom / xdit / custom
-  --gpu-type MI300X \          # or omit for rocm-smi auto-detect
+  --framework vllm \           # sglang (default) / vllm / atom / xdit / llamacpp / custom
+  --gpu-type mi300x \          # or omit to take the label of the card amd-smi reports
   --model-class moe_mla \      # dense / moe_mla / moe_swa / moe_mla_nsa; categorical key for atom seed grid + framework gap token + recipe key + prompt label
   --isl 512 --osl 512 \        # workload shape — pass whatever the prompt states; omitting them uses defaults ISL=1024/OSL=1024
   --conc 64 \                  # client concurrency — pass the prompt's value; default 64
@@ -770,16 +769,16 @@ and the operator's stated value is lost:
 | Surface | CLI flag | Notes |
 |---|---|---|
 | Model path | `--model` | required |
-| Framework | `--framework` | `sglang` (default) / `vllm` / `atom` / `xdit` / `custom` — atom is single-node-only; xdit is scriptable diffusion (`img/s`, no serving server); `custom` is an operator-supplied workload and **additionally requires `--framework-path` and `--benchmark-scripts-dir`** (see below) |
-| Custom source tree | `--framework-path` | **Required for `--framework custom`.** The workload's own checkout; patches are authored against it. |
+| Framework | `--framework` | `sglang` (default) / `vllm` / `atom` / `xdit` / `llamacpp` / `custom` — atom is single-node-only; xdit is scriptable diffusion (`img/s`, no serving server); llamacpp builds `llama-server` from the `--framework-path` checkout, which it **requires** (as it does `HYPERLOOM_ACTIVE_IMAGE_REF` and `HYPERLOOM_ACTIVE_IMAGE_DIGEST` in the environment, see `docs/reference/environment-variables.md`), and runs that build; it takes its base launch from `--reference-script` only, and records no profile or roofline; `custom` is an operator-supplied workload and **additionally requires `--framework-path` and `--benchmark-scripts-dir`** (see below) |
+| Framework source tree | `--framework-path` | **Required for `--framework custom` and `--framework llamacpp`.** The workload's own checkout (for llamacpp, the llama.cpp checkout the server is built from); patches are authored against it. |
 | Custom bench scripts | `--benchmark-scripts-dir` | **Required for `--framework custom`.** Holds the entrypoint, looked up as `custom_<gpu-type>.sh`. Every knob it reads must be forwarded as `--extra-env`; the throughput unit is whatever its report declares. May also hold `levers.json` — the adapter's declared explore grid (see below). |
 | Declared levers (`custom`) | `<benchmark-scripts-dir>/levers.json` | Optional. A JSON **list** of explore variants the adapter declares for itself — `{"name": ..., "extra_envs": {...}}` (an object), or any of `extra_args` / `remove_args` / `unset_envs` / `args_mode: "replace"`. `custom` has no framework source to infer knobs from, so without this its seed grid is empty and EXPLORE has nothing to sweep until the model guesses. Declarations seed **ahead of** model proposals (a model variant of the same name wins) and are not re-seeded once their name appears in the explore ledger's `tested` rows. A malformed file — or one whose variant normalizes to nothing a restart could apply — fails the launch with exit 2; it never degrades to an empty grid. |
 | xDiT model name | `--xdit-model-name` | **Required for `--framework xdit`.** The xDiT model registry name (e.g., `FLUX.2-dev` or `black-forest-labs/FLUX.2-dev`). xDiT uses this to select the correct diffusion pipeline class; unlike vLLM/SGLang, it cannot infer the pipeline from the model path alone. |
-| GPU type | `--gpu-type` | rocm-smi auto-detect when unset |
+| GPU type | `--gpu-type` | The label of the card the machine reports. Pass only a GPU the prompt names, as a label such as `mi355x`; it is used when the card reports no model name (see `## GPU Type`). |
 | Model class | `--model-class` | categorical key for the deterministic consumers (atom seed grid, framework-agent gap search token, recipe key, prompt label); when unset, Coordinator boot infers and persists it from model metadata or model-path family keywords. For richer advisory model context see Step 1.5 (`model_arch.json`) |
 | Input seq length | `--isl` | Pass the prompt's ISL. Default `1024` when omitted. |
 | Output seq length | `--osl` | Pass the prompt's OSL. Default `1024` when omitted. |
-| Concurrency | `--conc` | Pass the prompt's CONC (max in-flight requests). Default `64`. SWEEP measures a ladder around it (native AgentX instead fixes CONC in its YAML); `--conc-sweep-concs` overrides the workload's default ladder. |
+| Concurrency | `--conc` | Pass the prompt's CONC (max in-flight requests). Default `64`. Native AgentX instead fixes CONC in its YAML. |
 | Tensor parallel | `--tp` | Pass the prompt's TP. Default `1`. |
 | Expert parallel | `--ep` | Pass the prompt's EP for MoE. Default `1`. |
 | Precision | `--precision` | Match the checkpoint (`bf16` default / `fp8` / ...). Keep consistent with `--quantize`. |
@@ -795,10 +794,10 @@ and the operator's stated value is lost:
 | Target advisory | `--no-target-advisory` | Disable external-target hints in prompts without disabling final-report comparison. `primary_gap` uses the existing latency/throughput categories; the interactivity axis is displayed as interactivity. |
 | Quantization prelude | `--quantize` | Optional. Natural-language quantization request. Runs the quantization-agent once before the loop and rewrites `--model` to the quantized model. See Step 2b. Never runs on a resume. |
 | Env pins | `--extra-env NAME=VALUE` | Repeatable; forward **every** one verbatim as its own flag (do not drop any or fold into the `Environment:` block). The CLI persists them in `state.json` and serializes them into `$INFERENCE_OPTIMIZER_EXTRA_ENV`; a dropped pin is lost silently — e.g. a missing `SGLANG_USE_AITER=0` leaves the explore aiter-MoE filter blind. A `--resume-from` re-exports the persisted set, so re-pass them only to change the set. |
-| Session directory | `--session-dir DIR` | Only when a launcher must know the session path before the run starts, as the hosted entry does. An absolute path below `$USER_DATA_PATH`; the new session is created in exactly that directory instead of `<model>/<UTC_ts>-<rand8>`. The CLI refuses it (exit 2) together with `--resume-from`, which names the directory it resumes. Absent, the directory is generated as before. |
+| Session directory | `--session-dir DIR` | Only when a launcher must know the session path before the run starts. An absolute path below `$USER_DATA_PATH`; the new session is created in exactly that directory instead of `<model>/<UTC_ts>-<rand8>`. The CLI refuses it (exit 2) together with `--resume-from`, which names the directory it resumes. Absent, the directory is generated as before. |
+| Launch-config-only result | `--no-source-changes --no-framework-local-explore --no-static-recon` | Only when the prompt asks for a result that holds nothing but server arguments and environment variables — one that fits a deployment profile, or "no patches". `--no-source-changes` alone gives that result: it skips every integrate round that carries a patch, upstream PR, tuned artifact, rewrite switch, setup command or other runtime, or a setting that names a file under the session directory (`skipped_reason=no_source_changes`; an `explore` with such a variant is denied), and it turns off the kernel phase and the PRELUDE replay of the recipe's patches and kernel champions, which never reach that gate (no `--no-kernel` or `--no-warm-replay` needed). The other two only save budget. Specialists, research and enablement still run. Persisted; a `--resume-from` keeps it on. |
 | Operator-defined specialist | `--custom-specialist-prompt-file` + `--custom-specialist-description` | Only when the prompt asks for a specialist with its own focus. Write the operator's focus text verbatim to a file and pass its path (max 16 KiB); the description is one line (max 200 chars) describing it in its own prompt. Pass both or neither. Export `HYPERLOOM_CUSTOM_SPECIALIST_ONLY=1` before launch only when the prompt asks to run that specialist alone. The CLI refuses them (exit 2) together with `--no-framework-agent`, `--research-lane-capacity 0` or `--reset-state`. Persisted in `state.json`; a `--resume-from` keeps the stored definition, so re-pass both only to replace it, or pass `--reset-state` alone to clear it. |
 | PrimaTune predictor | `--primatune-endpoint` + `--primatune-mode` | Only when the prompt names a PrimaTune service. `active` queues its proposals for benchmarking; `shadow`, the default with an endpoint, only logs them; `off` disables an endpoint the environment exports. Not persisted: a `--resume-from` relaunch needs the flags again unless the shell exports `HYPERLOOM_PREDICTOR_ENDPOINT` / `HYPERLOOM_PREDICTOR_MODE`. See `docs/reference/primatune-predictor.md`. |
-| Plug selection | `--plug-profile` / `--manifest` / `--plug SOCKET=IMPL` / `--plug-config SOCKET.KEY=VALUE` | Only when the prompt names a plug profile, manifest or implementation; otherwise pass none and the run is a plain local run. `--plug-profile` loads a built-in profile (`local`, `hosted-gpu`, `hosted-cpu`); `--manifest` (or `$HYPERLOOM_MANIFEST`) a JSON manifest laid over it; `$HYPERLOOM_MANIFEST_OVERRIDES` a JSON file over that; `--plug` and `--plug-config` (repeatable, a JSON value is read as JSON) win over all of them. A selection is written to `$SESSION_DIR/plugs.resolved.json` and a `--resume-from` reads it back first, so re-pass the flags only to change the selection. The CLI refuses (exit 2) a socket or implementation that does not exist, a malformed manifest, an unset `${VAR}` with no default, and a damaged `plugs.resolved.json`. |
 
 ### Step 2b — Optional quantization prelude (`--quantize`)
 
@@ -826,7 +825,8 @@ python3 -m hyperloom optimize \
   session is serving.
 - **Structured path for UI/backends**: instead of free text, pass
   `--quantize-scheme <enum>` (one of `none` / `fp8` / `ptpc_fp8` / `mxfp4` /
-  `mxfp4_fp8`); `mxfp4` / `mxfp4_fp8` are **MI355X-only**. It resolves to a
+  `mxfp4_fp8`); `mxfp4` / `mxfp4_fp8` need a **gfx950** card (MI350X / MI355X),
+  and are not checked when the session read no card. It resolves to a
   curated prompt internally (`src/hyperloom/orchestrator/phases/quantization_schemes.py`). `none` or
   omit = no quantization. Free-text `--quantize` takes priority when both given.
 - **Keep `--precision` consistent with the quantization.** When a quantization
@@ -846,7 +846,7 @@ python3 -m hyperloom optimize \
   quantization the run **hard-stops (`SystemExit(4)`)** — it never silently
   optimizes the un-quantized source after an explicit `--quantize`.
   With the switch on, the one exception is a **pre-flight scheme/GPU mismatch** via
-  `--quantize-scheme` (e.g. `mxfp4` on a non-MI355X target): this is **skipped**
+  `--quantize-scheme` (e.g. `mxfp4` on a gfx942 card): this is **skipped**
   (not a hard stop) and continues on the un-quantized model, emitting a
   `QUANTIZATION_SKIPPED:` line on stdout and setting
   `$HYPERLOOM_QUANTIZATION_SKIPPED` so the caller can detect it.
@@ -864,7 +864,6 @@ node; do not stop for an extra confirmation. After IR-2, smoke-test the
 CLI:
 
 ```bash
-export WORKSPACE_PATH="${WORKSPACE_PATH:-/workspace}"
 # TRACELENS_ROOT: leave unset to let install.sh clone AMD-AGI/TraceLens
 # to ${HYPERLOOM_CACHE_DIR:-$REPO_ROOT/.cache}/TraceLens@<sha> and pin it
 # to a fixed SHA. Only export it as an operator override to point at a
@@ -882,14 +881,12 @@ bash "$INSTALL_SH"
 ```
 
 Quirks: with `set -u`, assign dependent vars on separate lines (chained
-`export A=... B=$A` can fail with `unbound variable`). The installer
-leaves a live Ray head; `ray status` must succeed because `trace_analyze`
-submits tasks with `num_gpus>=1` — never restart Ray with `--num-gpus=0`.
+`export A=... B=$A` can fail with `unbound variable`).
 
 `_preflight()` runs every launch as the in-loop counterpart of IR-2 and
 **owns** the things the launcher must NOT do by hand: re-export auth
 aliases (LLM) from `OPENAI_API_KEY`,
-auto-`pip install` the SDKs / `ray`, ROCm hygiene, `--gpu-type` auto-detect, and it emits the
+auto-`pip install` the SDKs, ROCm hygiene, reading the GPU card, and it emits the
 canonical `Preflight diagnostics:` block (paste verbatim into status
 reports). Two checks **abort** the run on failure: the model gate
 (probed against `<OPENAI_BASE_URL>/models`; the allowlist
@@ -900,7 +897,7 @@ the catalog probe is the sole gate; see
 `## Failure Handling`) and, when `--critic-agent` is active, the
 critic-agent runtime probe (`## Critic Backend Selection`).
 
-Don't manually pip-install SDKs, start Ray,
+Don't manually pip-install SDKs
 or `curl /v1/models` — `_preflight()` owns these. See `docs/reference/kernel-execution-path.md`
 for the kernel dispatch and artifact layout.
 
@@ -1050,9 +1047,13 @@ Operator server flags have one supported CLI entry point:
 profile, explore, and sweep. Explicit `--max-model-len` / `$MAX_MODEL_LEN`
 wins over auto `ISL+OSL+headroom`. A comma `$CONC` value such as
 `4,16,128` is accepted for compatibility; baseline uses the first value.
-Use `--conc-sweep-concs` to override the synthetic ladder SWEEP measures (`256,128,64,32,16,8,4,2`). Native AgentX uses `HYPERLOOM_AGENTX=1` with the ordinary workload flags, or `--benchmark-config` for an AgentX workload YAML. Hyperloom archives the resolved workload as `benchmark.yaml`; CONC is fixed per session, so start a separate session to measure another concurrency.
+Native AgentX uses `HYPERLOOM_AGENTX=1` with the ordinary workload flags, or `--benchmark-config` for an AgentX workload YAML. Hyperloom archives the resolved workload as `benchmark.yaml`; CONC is fixed per session, so start a separate session to measure another concurrency.
 
-Native AgentX supports one node and SGLang, vLLM or ATOM; an ATOM session takes its base from InferenceX's ATOM agentic entries. It rejects `--enable-conc-sweep`,
+For server-less PyTorch workloads (`custom` and `xdit`), optimize the declared
+forward-pass workload; do not propose request concurrency as an optimization
+for these models.
+
+Native AgentX supports one node and SGLang, vLLM or ATOM; an ATOM session takes its base from InferenceX's ATOM agentic entries. It rejects
 `--isl`, `--osl`, `--profile-osl`, `--max-model-len`, `--quantize` and
 `--quantize-scheme`. `--reference-script` is its base launch, ahead of the
 recipes; a session no recipe serves and given no script exits 2. Prepare quantized checkpoints before the run.
@@ -1120,8 +1121,7 @@ so it is kept in one place.
 | Var | Purpose | Default |
 |---|---|---|
 | `CRITIC_AGENT_ROOT` | Path to the directory containing `runtime/cli.py`. | in-tree `$REPO_ROOT/src/hyperloom/agents/critic/` |
-| `CRITIC_SESSION_MEMORY_DIR` | Where the runtime persists per-session decisions / reviewed_msg_ids. | `$SESSION_DIR/critic-session-memory` (auto-set by the optimizer; co-located with the Coordinator session and cleaned up alongside it). |
-| `WORKSPACE_PATH` | Skill root the critic-agent runtime resolves prompt assets against. | `$REPO_ROOT` (auto-set). |
+| `CRITIC_SESSION_MEMORY_DIR` | Where the runtime persists per-session reviewed_msg_ids. | `$SESSION_DIR/critic-session-memory` (auto-set by the optimizer; co-located with the Coordinator session and cleaned up alongside it). |
 
 CLI startup checks that `CRITIC_AGENT_ROOT` resolves to a real directory
 with `runtime/cli.py`, then runs `python -m hyperloom.agents.critic.runtime.cli --help`
@@ -1157,14 +1157,15 @@ What this controls:
 - Which workload YAML the executors default to —
   `baseline_<framework>.yaml` and `profile_<framework>.yaml`, one pair
   per framework registered in `framework_registry`
-  (`sglang`, `vllm`, `atom`, `xdit`, `custom`).
+  (`sglang`, `vllm`, `atom`, `xdit`, `custom`); `llamacpp` ships
+  `baseline_llamacpp.yaml` alone, as its server runs under no torch profiler.
   `framework_registry.shipped_config_name()` names the file for
   `$FRAMEWORK`; an unregistered name is refused at launch and on resume.
 - Which framework-specific seed grid the `explore` action falls
   back to when no `params.grid` is supplied. atom and xdit are the
   frameworks with programmatic seeds today
   (`_default_grid_for_framework` in
-  `src/hyperloom/orchestrator/actions/executors/_grid_base.py` dispatches to
+  `src/hyperloom/orchestrator/actions/executors/grid/_grid_base.py` dispatches to
   `_atom_default_grid()` / `_xdit_default_grid()`); sglang and vllm continue to rely on
   the orchestration LLM emitting `provenance='default_grid'`
   variants. On those two an `explore` that carries no usable
@@ -1228,25 +1229,39 @@ full env-var set, and `docs/reference/session-breakdown.md` for the emitted
 
 ## GPU Type
 
-Pick the GPU explicitly with `--gpu-type` or `$GPU_TYPE`; without
-either, the optimizer auto-detects via `rocm-smi --showproductname`
-(falling back to `torch.cuda.get_device_properties(0).gcnArchName`).
+Every start and resume reads the GPUs with `amd-smi static`, else `rocm-smi`,
+else torch's `gcnArchName`; a multi-node session reads a remote node's the same
+way. When the cards the visible-device masks leave are not one kind (same arch,
+compute units and memory), the launch warns, listing each kind, and takes the
+first. That card's arch and facts decide everything that depends
+on the hardware: the default launch row, FP4 quantization, roofline peaks
+and Recipe KB arch matching. There is no list of supported
+boards, so a GPU Hyperloom has not seen before still runs.
+
+The GPU type is the label results, recipes and benchmark scripts are filed
+under: the card's market name reduced to its model designation (`AMD Instinct
+MI355X` → `mi355x`, `AMD Radeon AI PRO R9700` → `r9700`). Pass `--gpu-type` or
+`$GPU_TYPE` only when the prompt names the GPU; the name is used when the
+driver gives the card no model name or no card was read, and without one such
+a card is filed under its arch.
 
 ```bash
 python3 -m hyperloom optimize --gpu-type mi355x --model "$MODEL_PATH" --max-hours 2
 GPU_TYPE=mi300x python3 -m hyperloom optimize --model "$MODEL_PATH" --max-hours 2
 ```
 
-Accepted values: `mi300x`, `mi308x`, `mi325x`, `mi355x`, `r9700`, `r9600d`,
-`w7900`, `w7900d`, `radeon8060s`. The GPU type is the board the base launch is resolved for:
-a recipe for another board is used only when both share the gfx target and
-HBM size (`mi350x` / `mi355x` do; `mi300x` / `mi325x` do not), and its point
-is chosen for `--nodes` × `--gpus-per-node` (default 8) GPUs.
+The card's own name wins over a given one, so that recipes and KB rows match
+the hardware: the launch prints a `WARN` naming both. A resume keeps the label the session
+recorded and reads the card again. With no card read and no name given, the
+session has no label and its base launch is refused: pass `--gpu-type`.
 
-`r9700` (Radeon AI PRO R9700, gfx1201), `r9600d` (Radeon AI PRO R9600D,
-gfx1201) and `w7900` / `w7900d` (Radeon PRO W7900 / W7900D, gfx1100) run with
-`--framework vllm` only: pass `--framework vllm`, since
-another framework (including the default) exits with code 2 at launch.
+The base launch is resolved for the label: a recipe serves only the board it
+was tuned on (an `mi350x` launch does not serve an `mi355x`); to borrow one,
+write it as a launch script and pass `--reference-script`. Its point is chosen
+for `--nodes` × `--gpus-per-node` (default 8) GPUs. Every framework launches on
+every board; where no recipe serves, the default table's row for the card's
+arch runs, or the framework's fallback row (`--trust-remote-code` only, with a
+warning) for an arch the table has no row for.
 
 Do not set `HIP_VISIBLE_DEVICES` on the known ROCm stack unless the user asks;
 it can make `torch.cuda.is_available()` return false. Use
@@ -1270,8 +1285,7 @@ where a draft/MTP path exists, benchmarked with chat-formatted prompts.
 To override shipped configs without editing them, materialize a per-run asset
 root and `export INFERENCE_OPTIMIZER_ASSET_ROOT="$ASSET_ROOT"` (env var, not a
 CLI flag; `asset_root()` raises `AssetRootNotFound` if the dir is missing).
-`mkdir -p "$ASSET_ROOT/assets/configs"`, `ln -sfn` `actions/` from
-`$REPO_ROOT/src/hyperloom/inference_optimizer/` and `orchestrator/` from
+`mkdir -p "$ASSET_ROOT/assets/configs"`, `ln -sfn` `orchestrator/` from
 `$REPO_ROOT/src/hyperloom/`, then
 copy + edit the relevant `baseline_*.yaml` / `profile_*.yaml`. Reach for this
 only when `_workload_envs.materialize_config_with_envs` defaults don't fit
@@ -1486,19 +1500,6 @@ and keep the `ps` check for the optimizer PID recorded in the pidfile.
 Health checks only observe and reconcile launch metadata; they must not kill,
 restart, or automatically resume the optimizer.
 
-## Hosted Run (`hyperloom hosted run`)
-
-Not a launch you run by hand: a hosting platform starts it. `hyperloom hosted run` takes no arguments. It reads the host's inputs
-(`HYPERLOOM_INPUT_FILE` for the campaign spec `hyperloom.campaign-spec/v1`, plus `HYPERLOOM_RUN_ID`, `HYPERLOOM_RUN_CREATED_AT`,
-`HYPERLOOM_STATE_DIR` and the rest listed in `docs/reference/environment-variables.md`), removes the host-only ones from its
-environment, and runs `optimize` in the same process: `--resume-from <dir> --plug-profile <profile>` when the run's session
-directory already holds `manifest.json` and `state.json`, otherwise the spec mapped to `optimize` flags plus
-`--plug-profile <profile> --session-dir <dir>`. The directory is derived from the run, so a restart resumes the same session.
-It records the outcome in `$HYPERLOOM_STATE_DIR/exit.json`; the host restarts the run only when `final` is not true. A spec it
-refuses ends with `final: true` and return code 2. A spec with `flow: "multibranch"` is handed to `hyperloom-multibranch hosted
-run` after the same `install.sh` run as the legacy flow, with the entry's environment plus the running interpreter's bin
-directory first on `PATH`.
-
 ## Resume Existing Session
 
 `--resume-from "$SESSION_DIR"` is the only way to resume; there is no
@@ -1567,7 +1568,7 @@ python3 -m hyperloom session state "$SESSION"
 ```
 
 It prints `stop_reason`, `baseline_tput`, `cumulative_gain_validated`, `current_best`,
-`last_trace_analyze`, `last_conc_sweep`, `explore_last_round`,
+`last_trace_analyze`, `explore_last_round`,
 `phase`, the latest orchestration and specialist Experience KB injections when
 they exist, plus the recent lifecycle events.
 
@@ -1593,7 +1594,7 @@ The optimizer should:
   `roofline` (profile + trace_analyze + analysis.md); `--no-enable-roofline`
   switches to plain `profile`. The LLM cannot propose either —
   both names are Coordinator-managed and a proposal for either is denied with
-  `rule="coordinator_managed_action"`. Concurrent GPU work is
+  `rule="phase_incompatible"`. Concurrent GPU work is
   serialised by the lane / GPU lease rather than a policy deny, so
   explore / kernel dispatches keep flowing while analysis refreshes.
   Each analysis also stamps a decode roofline ceiling
@@ -1745,7 +1746,7 @@ Bypass with `--critic-mock` for offline / smoke runs. See
 - Repeated `trace_analyze` with unchanged trace/config: bug — reuse `last_trace_analyze`.
 - `correctness_passed=false`: do not integrate; the kernel-agent report must contain explicit correctness evidence.
 - `stop_reason=no_more_leverage`: stop and report; only resume if the user changes workload / search space / model / strategy.
-- `policy_denied` streaks (not a stop reason — nothing in the runtime stops a run over them): repeated denial of the same (action, rule) pair is advisory only — there is no auto-prune at streak ≥5 and no stop at streak ≥10. Inspect `SharedState.policy_denial_history` via the `why_denied` tool or the `=== Recent policy denials ===` block, then change something substantive (a new `params.grid` variant or a sibling action family). Do not hand-edit `state.json`.
+- Repeated `policy_denied` events (not a stop reason — nothing in the runtime reacts to them): each denial is a `policy_denied` observation in the denied agent's inbox and a `denials` row on the phase event in `session_breakdown.json`; read the rule and hint there, then change something substantive (a new `params.grid` variant or a sibling action family). Do not hand-edit `state.json`.
 - `stop_reason=time_exhausted`: resume same session (`--resume-from`); do not start fresh.
 
 ## Report Back To User
@@ -1758,3 +1759,5 @@ Report concise status:
 - last kernel optimized, correctness, micro speedup, E2E gain, decision
 - any new `experience_kb_injections` entry: each injected Experience's summary and its section of `prompt_block`
 - whether the process is still running or stopped and why
+- unless the sweep is off (`--no-enable-conc-sweep`), the sweep's `status`, points and best speedup from `reports/conc_sweep_summary.json`;
+  the sweep runs after CLOSE (`hyperloom conc-sweep SESSION_DIR` reruns the points not yet measured)

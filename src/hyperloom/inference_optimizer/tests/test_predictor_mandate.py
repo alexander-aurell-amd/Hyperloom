@@ -73,7 +73,7 @@ async def coordinator(tmp_path, monkeypatch):
     """A real Coordinator holding the mandate, with a framework checkout for patch specialists."""
     from hyperloom.inference_optimizer.session.paths import make_session_dir
     from hyperloom.orchestrator.loop.coordinator import Coordinator
-    from hyperloom.orchestrator.roles import MockBackend, ScriptedPlan
+    from hyperloom.orchestrator.tests.mock_backend import MockBackend, ScriptedPlan
 
     monkeypatch.setenv("USER_DATA_PATH", str(tmp_path))
     silent = ScriptedPlan(turns=[])
@@ -115,7 +115,10 @@ async def test_a_delegate_citing_no_known_mandate_is_refused_rather_than_run_on_
     await _delegate_specialist(coordinator, params, "m2")
 
     assert await coordinator.tasks.by_state("queued") == []
-    assert coordinator.shared_state.policy_denial_streak == {"specialist:unknown_primatune_mandate": 1}
+    denied = [
+        m.payload for m in await coordinator.bus.tail(topic="observation") if m.payload.get("kind") == "policy_denied"
+    ]
+    assert [row["rule"] for row in denied] == ["unknown_primatune_mandate"]
     assert "mandate_consumed_by" not in coordinator.shared_state.specialist_rounds[0]
 
 
@@ -131,7 +134,7 @@ def test_a_consumed_mandate_is_withdrawn_and_keeps_its_first_consumer():
 
 
 def test_the_patch_keeps_the_predictors_provenance_on_its_way_to_integrate_patch():
-    from hyperloom.orchestrator.phases.framework import _forward_integrate_source
+    from hyperloom.orchestrator.phases.framework_proposals import _forward_integrate_source
 
     dst: dict[str, Any] = {}
     _forward_integrate_source({"provenance": "primatune", "lever_kind": "source_patch"}, dst, {})

@@ -38,25 +38,25 @@ from ..stop_attribution import (
 from inference_suite import stop
 from inference_suite.contracts import FailedStep
 
-from . import _server_lifecycle as _lifecycle
-from ._grid_base import GridRound, run_grid_suite_round
+from .serving import _server_lifecycle as _lifecycle
+from .grid._grid_base import GridRound, run_grid_suite_round
 from ._suite.rounds import SuiteRoundRefused, SuiteRoute, suite_route
 
 # The grid module is the namespace the helpers both benching arms share ended up in: how a sentinel returncode reads
 # back, how a round's cap is clamped to the budget, how the two session bounds are resolved, and the hygiene every
 # launch needs.
-from ._grid_runner import SessionDirField, session_grid_bounds
-from ._grid_base import sync_benchmark_timeout
+from .grid._grid_inputs import SessionDirField, session_grid_bounds
+from .grid._grid_base import sync_benchmark_timeout
 from ._subprocess_kill import (
     AGENTX_PREFLIGHT_ERROR_CLASS,
     resolve_benchmark_timeouts,
 )
 from ._accuracy_gate import materialized_run_eval_disabled
 
-from ._workload_envs import (
+from .workload._workload_envs import (
     default_baseline_config,
 )
-from ._agentx_prefix_cache import refuse_cacheless_agentx_baseline
+from .workload._agentx_prefix_cache import refuse_cacheless_agentx_baseline
 from .benchmark_config import prepare_agentx_runtime
 from .benchmark_result import (
     double_run_requested,
@@ -93,22 +93,6 @@ _MN_WARMUP = "mn_warmup"
 _PROGRESS_UNIT = "baseline_round"
 
 
-# Markers identifying a MoE quant scheme with no implementation for the ``--moe-runner-backend`` in use:
-# ``create_moe_runner`` falls through without building a runner and the first forward pass dies (e.g. Quark MXFP4 on
-# triton).
-_MOE_RUNNER_MISSING_MARKERS = (
-    "has no attribute 'runner'",
-    'has no attribute "runner"',
-)
-_MOE_SCHEME_CONTEXT_MARKERS = (
-    "create_moe_runner",
-    "moe_runner",
-    "_moe.py",
-    "fused_moe",
-    "/moe/",
-)
-
-
 def _unaffordable_mn_round_result(round_: _BenchmarkRound, evidence: dict[str, Any]) -> dict[str, Any]:
     """The stopped result of a multi-node round whose two passes the session budget cannot afford."""
     log.warning(
@@ -130,7 +114,7 @@ def _unaffordable_mn_round_result(round_: _BenchmarkRound, evidence: dict[str, A
 
 
 class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _BenchmarkRoundsMixin):
-    """One benchmark action: materialize the config, launch the backend, retry, parse the report."""
+    """One benchmark action: materialize the config, launch the backend, parse the report."""
 
     benchmark_watchdog = False
     runs_accuracy_eval = True
@@ -192,15 +176,6 @@ class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _Bench
             return True
         return BenchmarkRunExecutor._failure_carries_markers(result, _EVAL_FAILURE_MARKERS)
 
-    @staticmethod
-    def _is_moe_runner_rooted_failure(result: dict[str, Any]) -> bool:
-        """Whether a failed baseline died on the MoE runner backend in use."""
-        return BenchmarkRunExecutor._failure_carries_markers(
-            result,
-            _MOE_RUNNER_MISSING_MARKERS,
-            _MOE_SCHEME_CONTEXT_MARKERS,
-        )
-
     async def __call__(self, ctx: RunnerContext) -> dict[str, Any]:
         """Run the action inside the session the context names."""
         from hyperloom.inference_optimizer.session.session_binding import named_session_scope
@@ -211,29 +186,19 @@ class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _Bench
 
     async def _run(self, ctx: RunnerContext) -> dict[str, Any]:
         """Run the action inside the bound session."""
-        return await self._run_retrying(ctx)
+        return await self._run_with_accuracy(ctx)
 
-    async def _run_pass(
-        self,
-        ctx: RunnerContext,
-        *,
-        recorder: Any,
-        attempt_reason: str,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        """Run one pass through :meth:`_run_once`, recorded as its own row."""
-        index = recorder.begin_run(attempt_reason=attempt_reason) if recorder is not None else 0
+    async def _run_pass(self, ctx: RunnerContext, *, recorder: Any) -> dict[str, Any]:
+        """Run :meth:`_run_once`, recorded as the action's run row."""
+        if recorder is None:
+            return await self._run_once(ctx)
+        recorder.begin_run()
         try:
-            result = await self._run_once(ctx, recorder=recorder, run_index=index, **kwargs)
+            result = await self._run_once(ctx, recorder=recorder)
         except BaseException as exc:
-            if recorder is not None:
-                recorder.end_run(
-                    run_index=index,
-                    result={"status": "failed", "error_class": type(exc).__name__, "error": repr(exc)},
-                )
+            recorder.end_run(result={"status": "failed", "error_class": type(exc).__name__, "error": repr(exc)})
             raise
-        if recorder is not None:
-            recorder.end_run(run_index=index, result=result)
+        recorder.end_run(result=result)
         return result
 
     async def _attempt_refusal(self, attempt: BenchmarkAttempt, output_dir: Path, shared_state: Any) -> dict | None:
@@ -281,20 +246,12 @@ class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _Bench
         # Whether THIS run actually executes lm-eval, read back from the materialized config the subprocess
         # consumes -- the single source of truth.
         attempt = replace(attempt, run_eval_disabled=materialized_run_eval_disabled(config_path))
-        # Asked before the lease, because a round that will not be run should not hold a GPU while being refused.
         refused = self._round_refused_before_ignition(attempt, output_dir, double_run=double_run, ctx_extra=extra)
         if refused is not None:
             return refused
         application = self._prepare_round_patches(params, output_dir, shared_state)
         if isinstance(application, Mapping) and application.get("status") == "failed":
             return self._roll_back_failed_patches(application, params, output_dir, shared_state)
-        # Ray-managed GPU execution (§12 T1): one held Ray lease (as many GPUs as the launch occupies) spans this baseline's benchmark
-        # rounds — a double-run's warmup + measure reuse one persistent server, so both must run under the same lease.
-        from ._grid_runner import lease_cards
-        from ._ray_serving import maybe_serving_lease
-
-        lease = maybe_serving_lease(num_gpus=lease_cards(config_path, self.session_dir))
-        attempt = replace(attempt, serving_lease=lease)
         try:
             if double_run:
                 guarded = self._run_cold_start_guarded_rounds
@@ -316,8 +273,6 @@ class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _Bench
             # stay patched; reverting it here handed prelude a clean tree and silently lost the replay.
             if application and not isinstance(application, Mapping):
                 _revert_legacy_warm_patch_trees(params)
-            if lease is not None:
-                lease.close()
 
     @staticmethod
     def _release_attempt(output_dir: Path) -> None:
@@ -442,7 +397,6 @@ class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _Bench
                     suite,
                     warm_round,
                     env_drop=frozenset(),
-                    serving_lease=round_.serving_lease,
                     on_poll=activity.note,
                 )
         except SuiteRoundRefused as exc:
@@ -502,7 +456,6 @@ class BenchmarkRunExecutor(_BaselineAccuracyMixin, _BenchmarkLaunchMixin, _Bench
             timeout_sec=timeout_sec,
             silence_timeout_sec=silence_timeout_sec,
             session_deadline_sec=session_deadline_sec,
-            serving_lease=attempt.serving_lease,
             server_already_ready=server_already_ready,
             run_eval_disabled=attempt.run_eval_disabled,
         )
@@ -549,7 +502,7 @@ class BaselineExecutor(BenchmarkRunExecutor):
             owns_event=not str(params.get(INLINE_EVENT_PARAM) or ""),
         )
         try:
-            result = await self._run_retrying(ctx, recorder=recorder)
+            result = await self._run_with_accuracy(ctx, recorder=recorder)
             shared_state = (getattr(ctx, "extra", None) or {}).get("shared_state")
             is_agentx = agentx_active(benchmark_mode=getattr(shared_state, _BENCHMARK_MODE_ATTR, ""))
             if _should_establish_quality_ref(getattr(ctx.task, "kind", ""), params) and is_agentx:

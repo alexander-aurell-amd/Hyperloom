@@ -13,30 +13,11 @@ from hyperloom.inference_optimizer.protocol.intent import (
     EXTEND_LEASE_MAX_SEC,
     Intent,
     IntentType,
-    IntentValidationError,
-    validate_envelope,
 )
 from hyperloom.inference_optimizer.protocol.action_surfaces import COORDINATOR_OWNED_KERNEL_REQUEST_KINDS
 from hyperloom.orchestrator.policy.denial import PolicyDenied
 from hyperloom.orchestrator.policy.gate import PolicyGate
 from hyperloom.orchestrator.state.shared_state import SharedState
-
-
-# Intent vocabulary
-@pytest.mark.parametrize(
-    ("intent_type", "payload"),
-    [
-        pytest.param("kill_task", {"task_id": "t1", "reason": "stalled"}, id="kill_task"),
-        # Requests are answered inline on the ``response`` topic.
-        pytest.param("response", {"in_reply_to": "m1", "kind": "profile_done"}, id="response"),
-    ],
-)
-def test_retired_intent_type_is_rejected(intent_type, payload):
-    """A retired intent type left the vocabulary; an envelope carrying it must be rejected."""
-    assert intent_type not in {member.value for member in IntentType}
-    envelope = {"intents": [{"intent_type": intent_type, "payload": payload}]}
-    with pytest.raises(IntentValidationError, match="not in allowed set"):
-        validate_envelope(envelope)
 
 
 # PolicyGate validation
@@ -184,18 +165,6 @@ def test_gate_orchestration_review_verdict_rejected(gate):
             ),
         )
     assert exc.value.rule == "role"
-
-
-def test_gate_critic_review_verdict_unknown_verdict_rejected(gate):
-    with pytest.raises(PolicyDenied) as exc:
-        gate.validate_intent(
-            "critic",
-            Intent(
-                type=IntentType.REVIEW_VERDICT,
-                payload={"target_proposal_msg_id": "p1", "verdict": "objection"},
-            ),
-        )
-    assert exc.value.rule == "payload"
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,12 @@ import pytest
 
 from hyperloom_common.llm import claude_oneshot
 from hyperloom_common.env import EnvValueError
-from hyperloom_common.llm.llm_config import AGENT_BACKEND_CHOICES, deepseek_compat_env, resolve_forge_llm_model
+from hyperloom_common.llm.llm_config import (
+    AGENT_BACKEND_CHOICES,
+    deepseek_compat_env,
+    expand_custom_header_env_refs,
+    resolve_forge_llm_model,
+)
 from hyperloom_common.llm.llm_headers import parse_custom_headers
 from hyperloom.inference_optimizer import cli
 from hyperloom.inference_optimizer.cli import credentials as cli_credentials
@@ -30,7 +35,6 @@ from hyperloom.inference_optimizer.cli import framework_probe as cli_framework_p
 from hyperloom.inference_optimizer.cli import model_catalog
 from hyperloom.inference_optimizer.cli import preflight as cli_preflight
 from hyperloom.inference_optimizer.cli import preflight_env as cli_preflight_env
-from hyperloom.inference_optimizer.cli import ray_provision
 from hyperloom.inference_optimizer.cli import session_setup
 from hyperloom.inference_optimizer.cli.parser import _build_parser
 
@@ -482,7 +486,7 @@ def test_custom_header_env_refs_are_expanded_for_child_processes(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"Ocp-Apim-Subscription-Key: ${{{anthropic_key_var}}}")
     monkeypatch.setenv("OPENAI_CUSTOM_HEADERS", "X-Tenant: acme")
 
-    cli_preflight._expand_custom_header_env_refs()
+    expand_custom_header_env_refs()
 
     assert os.environ["ANTHROPIC_CUSTOM_HEADERS"] == "Ocp-Apim-Subscription-Key: ak-gateway-token"
     assert os.environ["OPENAI_CUSTOM_HEADERS"] == "X-Tenant: acme"
@@ -499,8 +503,8 @@ def test_a_header_ref_outside_the_credentials_does_not_reach_children(monkeypatc
         f"Ocp-Apim-Subscription-Key: ${{{anthropic_key_var}}}\nX-Leaked: ${{{other_secret_var}}}",
     )
 
-    with caplog.at_level(logging.WARNING, logger="hyperloom.inference_optimizer.cli"):
-        cli_preflight._expand_custom_header_env_refs()
+    with caplog.at_level(logging.WARNING, logger="hyperloom_common.llm.llm_config"):
+        expand_custom_header_env_refs()
 
     assert os.environ["ANTHROPIC_CUSTOM_HEADERS"] == (
         f"Ocp-Apim-Subscription-Key: ak-gateway-token\nX-Leaked: ${{{other_secret_var}}}"
@@ -523,7 +527,7 @@ def test_custom_header_ref_to_the_other_anthropic_credential_is_filled_in(monkey
     monkeypatch.setenv(set_var, "gw-token")
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", f"Ocp-Apim-Subscription-Key: ${{{referenced_var}}}")
 
-    cli_preflight._expand_custom_header_env_refs()
+    expand_custom_header_env_refs()
 
     assert os.environ["ANTHROPIC_CUSTOM_HEADERS"] == "Ocp-Apim-Subscription-Key: gw-token"
     assert referenced_var not in os.environ
@@ -1185,48 +1189,6 @@ def test_ensure_python_sdks_installs_missing_claude_agent_sdk(monkeypatch, capsy
     captured = capsys.readouterr().out
     assert "installing claude-agent-sdk" in captured
     assert "installed claude-agent-sdk" in captured
-
-
-# _ensure_ray
-def test_ensure_ray_skips_when_smoke_passes(monkeypatch, capsys):
-    """Ray smoke passes -> no pip install fires (probe uses the interpreter)."""
-    runner = _RecordingRun([_Completed(returncode=0)])
-    monkeypatch.setattr(ray_provision.subprocess, "run", runner)
-
-    ray_provision._ensure_ray("/opt/venv/bin/python", [])
-
-    assert len(runner.calls) == 1
-    probe = runner.calls[0]
-    # Probe validates Ray with the SAME interpreter, not shutil.which on PATH.
-    assert probe[0:2] == ["/opt/venv/bin/python", str(ray_provision._RAY_SMOKE_SCRIPT)]
-    assert "ray OK" in capsys.readouterr().out
-
-
-def test_ensure_ray_installs_when_smoke_fails(monkeypatch, capsys):
-    """When the Ray smoke fails, pip install runs with the SAME interpreter."""
-    runner = _RecordingRun(
-        [
-            _Completed(returncode=1, stderr="ray start does not accept --resources"),
-            _Completed(returncode=0),
-            _Completed(returncode=0),
-        ]
-    )
-    monkeypatch.setattr(ray_provision.subprocess, "run", runner)
-
-    ray_provision._ensure_ray("/opt/venv/bin/python", ["--break-system-packages"])
-
-    assert len(runner.calls) == 3
-    install_call = runner.calls[1]
-    assert install_call[0] == "/opt/venv/bin/python"
-    assert install_call[1:4] == ["-m", "pip", "install"]
-    assert "--break-system-packages" in install_call
-    assert any(arg.startswith("ray[default]==") for arg in install_call)
-    # Only Ray is repaired: the CLI is certified by what it parses, so no click
-    # release is pinned or downgraded on the way.
-    assert not any("click" in arg for arg in install_call)
-    captured = capsys.readouterr().out
-    assert "ray unusable (ray start does not accept --resources)" in captured
-    assert "ray installed OK" in captured
 
 
 # _ensure_bench_serving_deps

@@ -11,8 +11,17 @@ from dataclasses import replace
 
 import pytest
 
-from inference_suite.compose import GPU_MASK_ENV, READY_TIMEOUT_SEC, Refusal, RoundFacts, compose, runner_owned
-from inference_suite.contracts import FailedStep, GoldenUse, LaunchDelta, RunnerLayer
+from inference_suite.compose import (
+    GPU_MASK_ENV,
+    READY_MARGIN_SEC,
+    READY_TIMEOUT_SEC,
+    Refusal,
+    RoundFacts,
+    compose,
+    ready_timeout_sec,
+    runner_owned,
+)
+from inference_suite.contracts import FailedStep, GoldenUse, LaunchDelta, ProfileConfig, RunnerLayer, WorkloadKind
 from inference_suite.contracts.launch import (
     LAUNCH_SCHEMA,
     ClientInvocation,
@@ -24,8 +33,9 @@ from inference_suite.contracts.launch import (
     VersionCheck,
 )
 from inference_suite.recipe.image_version import recipe_image_facts
+from inference_suite.contracts.base_launch import Workload
 from inference_suite.tests.test_base_launch_contract import _base
-from inference_suite.tests.test_config_contract import _SHA, _accuracy_round, _config
+from inference_suite.tests.test_config_contract import _FIXED, _SHA, _accuracy_round, _config
 
 _FACTS = RoundFacts(
     config_sha256="d" * 64,
@@ -39,11 +49,12 @@ _FACTS = RoundFacts(
 )
 
 
-def _compose(base=None, **server_changes) -> Launch | Refusal:
+def _compose(base=None, boot_budget_sec=None, **server_changes) -> Launch | Refusal:
     base = base or _base()
-    server = _config().server
-    server = replace(server, base=replace(server.base, digest=base.digest()), **server_changes)
-    return compose(_config(server=server), base, _FACTS)
+    config = _config()
+    server = replace(config.server, base=replace(config.server.base, digest=base.digest()), **server_changes)
+    deadlines = replace(config.deadlines, boot_budget_sec=boot_budget_sec)
+    return compose(_config(server=server, deadlines=deadlines), base, _FACTS)
 
 
 def _launch(base=None, **server_changes) -> Launch:
@@ -404,13 +415,42 @@ _VLLM_BASE = _base(framework="vllm", entrypoint=("vllm", "serve"), args=("--tens
     "base, name",
     [(_base(), "SGLANG_WARMUP_TIMEOUT"), (_VLLM_BASE, "VLLM_ENGINE_READY_TIMEOUT_S")],
 )
-def test_the_guard_holds_the_frameworks_own_ready_timeout_past_any_round(base, name):
+def test_the_guard_holds_the_frameworks_own_ready_timeout_past_any_round_without_a_boot_budget(base, name):
     """A framework that gives up on its own start after a timeout of its own (600 s unset) would exit before the round's
-    boot deadline, which leaves aiter builds out and names the step; the guard puts that timeout past any round."""
+    boot deadline, which leaves aiter builds out and names the step; the guard puts that timeout past the default boot
+    limit of any round."""
     launch = _launch(base)
 
     entry = {entry.name: entry for entry in launch.env_sources}[name]
-    assert (entry.value, entry.source) == (str(READY_TIMEOUT_SEC), LayerSource.GUARD)
+    assert (entry.value, entry.source) == ("10800", LayerSource.GUARD)
+    assert READY_TIMEOUT_SEC == 10800
+
+
+@pytest.mark.parametrize(
+    "base, name",
+    [(_base(), "SGLANG_WARMUP_TIMEOUT"), (_VLLM_BASE, "VLLM_ENGINE_READY_TIMEOUT_S")],
+)
+@pytest.mark.parametrize(("budget", "expected"), [(14400, 18000), (21600, 25200), (14399.5, 18000)])
+def test_the_guard_holds_the_frameworks_own_ready_timeout_past_a_boot_budget_above_it(base, name, budget, expected):
+    """A test given a boot budget past 10800 s would otherwise watch a server that gave up on its own start first: the
+    guard follows the budget, with the headroom it keeps over the default boot limit."""
+    launch = _launch(base, boot_budget_sec=budget)
+
+    entry = {entry.name: entry for entry in launch.env_sources}[name]
+    assert (entry.value, entry.source) == (str(expected), LayerSource.GUARD)
+    assert int(entry.value) >= budget + READY_MARGIN_SEC
+
+
+@pytest.mark.parametrize("budget", [None, 60, 3600, 7200, 10800 - READY_MARGIN_SEC])
+def test_a_boot_budget_within_the_default_keeps_the_ready_timeout(budget):
+    """A budget only lengthens: one whose margin fits under 10800 s leaves the launch as it was without one."""
+    assert ready_timeout_sec(budget) == READY_TIMEOUT_SEC
+    entry = {entry.name: entry for entry in _launch(_VLLM_BASE, boot_budget_sec=budget).env_sources}
+    assert entry["VLLM_ENGINE_READY_TIMEOUT_S"].value == str(READY_TIMEOUT_SEC)
+
+
+def test_a_boot_budget_just_past_the_default_raises_the_ready_timeout():
+    assert ready_timeout_sec(10800 - READY_MARGIN_SEC + 1) == READY_TIMEOUT_SEC + 1
 
 
 def test_a_base_that_raises_the_ready_timeout_is_kept_and_the_guard_replaces_its_value():
@@ -440,3 +480,32 @@ def test_the_guard_replaces_a_ready_timeout_any_layer_sets(layer):
         (LayerSource(layer),),
     )
     assert "VLLM_ENGINE_READY_TIMEOUT_S" not in runner_owned(_VLLM_BASE).env
+
+
+def _llamacpp_compose(model_path) -> Launch | Refusal:
+    query = replace(_base().query, framework="llamacpp", workload=Workload.FIXED, tp=None, isl=1024, osl=512)
+    base = _base(query=query, framework="llamacpp", entrypoint=("llama-server",), args=("-ngl", "99"), golden_al=None)
+    config = _config(workload=WorkloadKind.FIXED, agentx=None, fixed=_FIXED, profile=ProfileConfig(False))
+    server = replace(config.server, base=replace(config.server.base, digest=base.digest()), model_path=str(model_path))
+    return compose(replace(config, server=server), base, _FACTS)
+
+
+def test_a_native_server_runs_as_its_entrypoint_on_the_one_model_file_of_its_directory(tmp_path):
+    (tmp_path / "Qwen-Q8_0.gguf").write_text("")
+    (tmp_path / "tokenizer.json").write_text("{}")
+    launch = _llamacpp_compose(tmp_path)
+
+    assert isinstance(launch, Launch), launch
+    assert launch.argv[0] == "llama-server"
+    assert ("--model", (str(tmp_path / "Qwen-Q8_0.gguf"),), "guard", ()) in _sources(launch)
+    assert ("--alias", ("glm",), "guard", ()) in _sources(launch)
+
+
+@pytest.mark.parametrize("files", [(), ("a.gguf", "b.gguf")])
+def test_a_model_directory_without_one_model_file_is_refused(tmp_path, files):
+    for name in files:
+        (tmp_path / name).write_text("")
+    refusal = _llamacpp_compose(tmp_path)
+
+    assert isinstance(refusal, Refusal)
+    assert (refusal.step, refusal.source) == (FailedStep.CONFIG_INVALID, LayerSource.GUARD)

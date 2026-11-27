@@ -13,10 +13,10 @@ from hyperloom.inference_optimizer import framework_registry as fr
 from hyperloom.inference_optimizer.roofline_ceiling import RooflineBreakdown
 from hyperloom.orchestrator.actions.executors import _accuracy_gate as ag
 from hyperloom.orchestrator.actions.executors import benchmark_result as br
-from hyperloom.orchestrator.actions.executors import _grid_runner as gr
-from hyperloom.orchestrator.actions.executors._grid_variant_filter import ServingStack
-from hyperloom.orchestrator.actions.executors import _grid_variant_filter as vf
-from hyperloom.orchestrator.actions.executors import explore as ex
+from hyperloom.orchestrator.actions.executors.grid import _grid_runner as gr
+from hyperloom.orchestrator.actions.executors.grid._grid_variant_filter import ServingStack
+from hyperloom.orchestrator.actions.executors.grid import _grid_variant_filter as vf
+from hyperloom.orchestrator.actions.executors.grid import _grid_base as ex
 
 
 class TestFrameworkRegistry:
@@ -315,7 +315,7 @@ class TestExploreGrid:
 
 
 def _default_config(kind: str):
-    from hyperloom.orchestrator.actions.executors import _workload_envs as we
+    from hyperloom.orchestrator.actions.executors.workload import _workload_envs as we
     from hyperloom.orchestrator.actions.executors import profile as pf
 
     return {"baseline": we.default_baseline_config, "profile": pf._default_profile_config}[kind]()
@@ -328,7 +328,13 @@ def _per_framework_tables() -> dict[str, dict]:
 
     return {
         "_ADAPTERS": adapters._ADAPTERS,
-        "parser_source": {item.value: item for item in Framework if framework_facts(item).parser_source is not None},
+        # D7 holds a Python server to its parser and a native one to its --help.
+        "flag_check": {
+            item.value: item
+            for item in Framework
+            if framework_facts(item).parser_source is not None
+            or (framework_facts(item).server_command is not None and framework_facts(item).server_command.native)
+        },
         "_DISABLE_CUDA_GRAPH_FLAGS": bringup._DISABLE_CUDA_GRAPH_FLAGS,
     }
 
@@ -339,10 +345,11 @@ class TestRegistryOwnsPerFrameworkAssets:
     @pytest.mark.parametrize("kind", ["baseline", "profile"])
     @pytest.mark.parametrize("framework", list(fr.FRAMEWORKS))
     def test_every_registered_framework_resolves_its_shipped_config(self, monkeypatch, kind, framework):
+        """A profile configuration ships for exactly the frameworks the torch profiler runs under."""
         monkeypatch.setenv("FRAMEWORK", framework)
         config = _default_config(kind)
         assert config.name == f"{kind}_{framework}.yaml"
-        assert config.is_file()
+        assert config.is_file() is (kind == "baseline" or fr.torch_profiled(framework))
 
     @pytest.mark.parametrize("kind", ["baseline", "profile"])
     def test_unset_framework_resolves_the_default_config(self, monkeypatch, kind):
@@ -387,7 +394,7 @@ class TestLifecycleScriptableSkip:
         }
         cfg_file = tmp_path / "config.yaml"
         cfg_file.write_text(yaml.safe_dump(cfg), encoding="utf-8")
-        from hyperloom.orchestrator.actions.executors._server_lifecycle import (
+        from hyperloom.orchestrator.actions.executors.serving._server_lifecycle import (
             resolve_lifecycle_params,
         )
 
@@ -406,7 +413,7 @@ class TestLifecycleScriptableSkip:
         }
         cfg_file = tmp_path / "config.yaml"
         cfg_file.write_text(yaml.safe_dump(cfg), encoding="utf-8")
-        from hyperloom.orchestrator.actions.executors._server_lifecycle import (
+        from hyperloom.orchestrator.actions.executors.serving._server_lifecycle import (
             resolve_lifecycle_params,
         )
 
@@ -477,40 +484,6 @@ class TestRooflineSnapshotUnits:
         table = "\n".join(rs.format_roofline_metrics_table(cmp))
         assert "**Roofline ceiling:** 2.0 img/s" in table
         assert "25.0%" in table
-
-
-class TestHyperloomArchSpec:
-    """TraceLens arch spec derived from the board's vendor peaks."""
-
-    def _tab(self):
-        from hyperloom.orchestrator.trace_analysis import tracelens_arch_benchmark as tab
-
-        return tab
-
-    def test_build_spec_mi355x_falls_back_to_vendor(self):
-        tab = self._tab()
-        spec = tab.build_hyperloom_arch_spec("mi355x")
-        assert spec is not None
-        assert spec["mem_bw_gbps"] == pytest.approx(8000.0)
-        assert spec["max_achievable_tflops"]["matrix_bf16"] == pytest.approx(2516.6)
-
-    def test_build_spec_case_insensitive_and_named(self):
-        tab = self._tab()
-        spec = tab.build_hyperloom_arch_spec("MI300X")
-        assert spec is not None
-        assert "matrix_bf16" in spec["max_achievable_tflops"]
-
-    def test_build_spec_unknown_platform_none(self):
-        tab = self._tab()
-        assert tab.build_hyperloom_arch_spec("nvidia-h100") is None
-
-    def test_write_spec_roundtrip(self, tmp_path):
-        tab = self._tab()
-        out = tmp_path / "MI300X.json"
-        assert tab.write_vendor_peak_arch_spec(out, "MI300X", lambda _m: None)
-
-        data = json.loads(out.read_text())
-        assert data["max_achievable_tflops"]["matrix_bf16"] == pytest.approx(1307.4)
 
 
 class TestValidateTraceStructureScriptable:

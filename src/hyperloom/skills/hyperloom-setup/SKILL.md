@@ -68,7 +68,7 @@ directory. Tell the user to open the intended dedicated workspace in the agent
 and install Hyperloom into that current directory:
 
 ```bash
-pip install hyperloom-inference-optimizer==1.1.5 --target .
+pip install hyperloom-inference-optimizer==1.2.0 --target .
 ```
 
 Then stop and ask the user to rerun `/hyperloom-setup` from that workspace.
@@ -89,8 +89,8 @@ value.
       proxy). Claude-side features are disabled.
    3. `Both` — each side with its own base URL and key. When both are
       configured, orchestration runs on Claude; the OpenAI side serves the
-      OpenAI-protocol features (Codex agents, GEAK's OpenAI path, proposal
-      scoring, `--critic-protocol openai`).
+      OpenAI-protocol features (Codex agents, GEAK's OpenAI path,
+      `--critic-protocol openai`).
 
    A side is configured by its own base URL and its own key; never write one
    side's key or URL for the other.

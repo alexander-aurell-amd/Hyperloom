@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from hyperloom_common.gpu_identity import gfx_arch_for_gpu_type
+from hyperloom_common.gpu_card import session_card
 
 from ._kernel_classification import _FLYDSL_SCAN_BYTES
 
@@ -155,8 +155,7 @@ def _candidate_model_config_paths(model_name: str) -> list[Path]:
         candidates.append(raw)
     candidates.append(raw / "config.json")
     # Optional models-root override (env-only; no hardcoded default). Standalone
-    # kernel-agent tools cannot import hyperloom.common (the Ray/subprocess
-    # sys.path contract in hyperloom.common.__init__), so this mirrors the shared
+    # kernel-agent tools cannot import hyperloom.common, so this mirrors the shared
     # resolver's strategy (local path + HF hub cache) independently.
     _root = os.environ.get("HYPERLOOM_MODELS_ROOT", "").strip()
     if _root:
@@ -264,26 +263,22 @@ def _resolve_flydsl_source_fallback() -> str:
     return ""
 
 
-def _flydsl_kernel_params(
-    source_file: str,
-    target_platform: str,
-) -> dict[str, Any]:
+def _flydsl_kernel_params(source_file: str) -> dict[str, Any]:
     """Build FlyDSL-specific kernel params.
 
-    Captures target arch, JIT cache state, and smem/buffer-load usage;
+    Captures the session card's arch, JIT cache state, and smem/buffer-load usage;
     best-effort and never raises.
 
     Args:
         source_file: The FlyDSL kernel source path.
-        target_platform: The target GPU platform name.
 
     Returns:
         The FlyDSL kernel-params dict (possibly partial).
     """
     params: dict[str, Any] = {}
-    arch = gfx_arch_for_gpu_type(target_platform)
-    if arch:
-        params["FLYDSL_TARGET_ARCH"] = arch
+    card = session_card()
+    if card is not None:
+        params["FLYDSL_TARGET_ARCH"] = card.gfx
     cache_dir = os.environ.get("FLYDSL_AUTOTUNE_CACHE_DIR", "").strip()
     if cache_dir:
         params["FLYDSL_AUTOTUNE_CACHE_DIR"] = cache_dir
@@ -349,10 +344,7 @@ def enrich_candidates_with_runtime_metadata(
         for key, value in model_params.items():
             params.setdefault(key, value)
         if item.get("source_type") == "flydsl":
-            flydsl_params = _flydsl_kernel_params(
-                str(item.get("source_file") or ""),
-                target_platform,
-            )
+            flydsl_params = _flydsl_kernel_params(str(item.get("source_file") or ""))
             for key, value in flydsl_params.items():
                 params.setdefault(key, value)
         flags = item.setdefault("runtime_flags", {})

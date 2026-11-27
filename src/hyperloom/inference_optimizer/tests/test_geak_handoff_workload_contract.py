@@ -13,8 +13,11 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 import yaml
 
-from hyperloom.orchestrator.actions.executors._server_lifecycle import GpuHandoff
-from hyperloom.orchestrator.actions.executors._workload_envs import build_agentx_workload_spec, geak_grading_fields
+from hyperloom.orchestrator.actions.executors.serving._server_lifecycle import GpuHandoff
+from hyperloom.orchestrator.actions.executors.workload._agentx_switch import (
+    build_agentx_workload_spec,
+    geak_grading_fields,
+)
 from hyperloom.orchestrator.loop.coordinator import Coordinator
 from hyperloom.orchestrator.state.shared_state import SharedState
 
@@ -169,7 +172,9 @@ def _gpus_at_handoff(
             raise answer
         return answer
 
-    monkeypatch.setattr("hyperloom.orchestrator.actions.executors._server_lifecycle.free_gpus_for_handoff", _check)
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.serving._server_lifecycle.free_gpus_for_handoff", _check
+    )
     return asked
 
 
@@ -240,6 +245,18 @@ async def test_native_handoff_keeps_supported_schema_and_seeds_geaks_own_launche
     assert spec["config"]["unset_envs"] == ["OBSOLETE_SETTING"]
     assert spec["launch_json"] == str(tmp_path / "accepted_run" / "launch.json")
     assert spec["config"]["args_mode"] == "replace"
+
+
+@pytest.mark.asyncio
+async def test_the_handoff_names_the_gpu_by_the_session_label_alone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """GEAK reads the card itself; a product/ISA pin beside the label would be a second, stale description of it."""
+    coord = _coord(tmp_path)
+    coord.shared_state.gpu_type = "r9700"
+
+    handoff = await _handoff(coord, monkeypatch)
+
+    assert handoff["gpu_type"] == "r9700"
+    assert not {"expected_target", "expected_gfx"} & set(handoff)
 
 
 @pytest.mark.asyncio
@@ -439,7 +456,9 @@ def _gpu_checks(monkeypatch: pytest.MonkeyPatch, answers: list[GpuHandoff]) -> l
         asked.append(cards)
         return answers[min(len(asked), len(answers)) - 1]
 
-    monkeypatch.setattr("hyperloom.orchestrator.actions.executors._server_lifecycle.free_gpus_for_handoff", _check)
+    monkeypatch.setattr(
+        "hyperloom.orchestrator.actions.executors.serving._server_lifecycle.free_gpus_for_handoff", _check
+    )
     return asked
 
 
@@ -470,19 +489,25 @@ async def test_a_measured_rebench_waits_for_its_gpus_and_runs_even_when_they_sta
     asked = _gpu_checks(
         monkeypatch, [GpuHandoff(reaped=[], busy=[(6, 120000.0, 288000.0)], holders=[holder], unverified="")]
     )
-    coord.writeback.geak_rebench_params = lambda *, reason: {"skipped": True, "reason": "geak_overlay_unloadable"}
-    replays: list[tuple[str, int]] = []
+    coord.writeback.geak_rebench_params = lambda *, reason: {"grid": []}
+    measured: list[tuple[str, int]] = []
 
-    async def _replay(*, decline_reason: str) -> None:
-        replays.append((decline_reason, len(asked)))
+    async def _measure(task) -> dict:
+        measured.append((task.kind, len(asked)))
+        return {"status": "failed"}
 
-    coord.phase_kernel._revalidate_on_geak_harness = _replay
+    async def _settle(_task, _result) -> None:
+        return None
+
+    coord.sub = Mock(execute_covered=_measure)
+    coord.writeback.is_promotable_result = lambda _kind, _result: False
+    coord.writeback.handle_unpromotable_result = _settle
 
     with caplog.at_level("ERROR", logger="hyperloom.orchestrator.phases.kernel_geak_dispatch"):
         await coord.phase_kernel._revalidate_geak_candidate(reason="geak_e2e_win", handoff_cards=[6, 7])
 
     assert asked == [[6, 7]]
-    assert replays == [("geak_overlay_unloadable", 1)]
+    assert measured == [("explore", 1)]
     assert "geak rebench: GPUs still hold VRAM after GEAK returned: GPU6 120000/288000 MiB" in caplog.text
     assert holder in caplog.text
 

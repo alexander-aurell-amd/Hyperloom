@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 from hyperloom.common.deadline import Deadline
 
 from hyperloom.inference_optimizer.breakdown.recorder import enablement_event
+from hyperloom.inference_optimizer.breakdown.stop_reasons import SOURCE_CHANGE_REFUSED_STOP_REASON
 
 from hyperloom.inference_optimizer.framework_paths import point_session_framework_root
 from hyperloom.inference_optimizer.grid_server_args import merge_server_args
@@ -91,7 +92,6 @@ def _authoring_dispatch(
         attempt=attempt,
         failure_kind=str(params.get("enablement_failure_kind") or ""),
         launch_log=launch_log,
-        candidate_refs=params.get("enablement_candidate_refs"),
         mode=str(state.enablement_mode or ""),
         origin=state.enablement.origin or enablement_event.ORIGIN_BOOT,
     )
@@ -128,11 +128,9 @@ class EnablementLane(CoordinatorCollaborator):
             if await self._round_has_live_work(round_row.holder_task_id):
                 await self._renew_enablement_round(round_row)
             return ""
-        # Each terminal below writes stop_reason, which routes the phase to CLOSE on the
+        # A terminal writes stop_reason, which routes the phase to CLOSE on the
         # next tick; returning keeps a new round from opening in the meantime.
-        if self._check_argv_terminal():
-            return ""
-        if self._check_environment_terminal():
+        if await self._reached_terminal():
             return ""
         stalled = await self.rounds.consecutive_stalled()
         if stalled >= _ENABLEMENT_MAX_ATTEMPTS:
@@ -141,8 +139,7 @@ class EnablementLane(CoordinatorCollaborator):
             return ""
         launch_log = state.enablement.launch_log
         deadline = self._coord.run_deadline
-        # Reaches the network and stats a checkout on a network mount, so it
-        # runs off the tick; discovery degrades to repos-only at the deadline.
+        # Stats a checkout on a network mount, so it runs off the tick.
         params = await offload(
             lambda: self._coord.enablement_params.build_enablement_specialist_params(launch_log, attempt=stalled),
             deadline=Deadline.after(ENABLEMENT_PARAMS_BUDGET_SEC).tightened_to(deadline),
@@ -151,8 +148,6 @@ class EnablementLane(CoordinatorCollaborator):
         if params is None:
             await self._maybe_record_enablement_human_review(launch_log)
             return ""
-        # Recorded on the loop rather than by the thread that found them.
-        state.enablement.candidate_refs = [str(r) for r in params["enablement_candidate_refs"]]
         # Any build the previous round's specialist asked for, then an
         # auto-escalation when the residual gap is a compiled miss. Both are
         # no-ops when a matching build is already queued or running, and neither
@@ -186,6 +181,38 @@ class EnablementLane(CoordinatorCollaborator):
             spec_tid,
         )
         return spec_tid
+
+    async def _reached_terminal(self) -> bool:
+        """Whether the lane is at one of its terminals, each of which has then written ``stop_reason``."""
+        return (
+            self._check_argv_terminal()
+            or self._check_environment_terminal()
+            or await self._check_source_change_terminal()
+        )
+
+    async def _check_source_change_terminal(self) -> bool:
+        """Stop the run if the last round's fix was a change ``--no-source-changes`` refuses.
+
+        Returns:
+            bool: True when the last round delivered such a change. Another round would author one that is refused
+            again, so the lane ends here rather than at the attempt cap, and closes its own event as the cap does.
+        """
+        state = self.shared_state
+        refused = state.enablement.last_refused_source_changes
+        if not refused:
+            return False
+        if not state.stop_reason:
+            state.set_stop_reason(SOURCE_CHANGE_REFUSED_STOP_REASON)
+            state.save(self.session_dir)
+            await self.close_lane_event(
+                outcome=enablement_event.OUTCOME_STALLED, reason=SOURCE_CHANGE_REFUSED_STOP_REASON
+            )
+            log.error(
+                "ENABLEMENT: the last round's fix is %s, which --no-source-changes refuses; stopping the run "
+                "rather than authoring another change the session will not keep",
+                ", ".join(refused),
+            )
+        return True
 
     def _check_argv_terminal(self) -> bool:
         """Write server_argv_invalid to stop_reason if the last boot was refused by the parser.
@@ -648,7 +675,7 @@ def _reset_baseline_failure_backstop(state: Any) -> None:
 
 
 def _stack_kept_runtime(state: Any, res: dict[str, Any]) -> None:
-    """Persist the accepted runtime, point the session framework tree at it, and keep the localization manifest."""
+    """Persist the accepted runtime, and point the session framework tree at it."""
     action = res.get("enablement_kept_stack_action")
     if isinstance(action, dict) and action:
         state.enablement.kept_stack_action = action
@@ -663,12 +690,6 @@ def _stack_kept_runtime(state: Any, res: dict[str, Any]) -> None:
         if source_root:
             point_session_framework_root(source_root, state.framework)
             state.framework_repo_path = source_root
-    # Record the localized closure manifest so it is not re-fetched on the next round.
-    manifest = res.get("enablement_localization_manifest")
-    if isinstance(manifest, dict) and manifest:
-        existing = list(state.enablement.localization_manifest or [])
-        existing.append(manifest)
-        state.enablement.localization_manifest = existing
 
 
 def _rearm_on_kept(state: Any, res: dict[str, Any]) -> None:

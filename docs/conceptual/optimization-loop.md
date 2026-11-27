@@ -2,7 +2,7 @@
 myst:
     html_meta:
         "description": "Understand the Hyperloom optimization loop: runtime contracts, phase order (PRELUDE through CLOSE), orchestration model, feedback loops, and session artifacts."
-        "keywords": "Hyperloom, optimization loop, PRELUDE, ENABLEMENT, FRAMEWORK_AGENT, KERNEL_AGENT, SWEEP, CLOSE, orchestration, session artifacts, AMD GPU, ROCm, LLM inference, PolicyGate, enablement, targeted build, escalation ladder, runnable gate"
+        "keywords": "Hyperloom, optimization loop, PRELUDE, ENABLEMENT, FRAMEWORK_AGENT, KERNEL_AGENT, CYCLE_END, CLOSE, orchestration, session artifacts, AMD GPU, ROCm, LLM inference, PolicyGate, enablement, targeted build, escalation ladder, runnable gate"
 ---
 # Hyperloom optimization loop
 
@@ -68,10 +68,10 @@ observable session artifacts and subprocess JSON bridges are.
 The Coordinator advances through the live phase chain:
 
 ```text
-PRELUDE -> ENABLEMENT -> FRAMEWORK_AGENT -> KERNEL_AGENT -> SWEEP -> CLOSE
+PRELUDE -> ENABLEMENT -> FRAMEWORK_AGENT -> KERNEL_AGENT -> CYCLE_END -> CLOSE
 ```
 
-Cyclic macro-cycling is always enabled. After SWEEP, the Coordinator can
+Cyclic macro-cycling is always enabled. After CYCLE_END, the Coordinator can
 `cycle_reloop` back to `FRAMEWORK_AGENT` for another pass while
 budget and leverage remain. The effective minimum remaining budget to justify
 opening a new cycle scales with session length (capped at the 3-hour absolute
@@ -119,6 +119,12 @@ PRELUDE establishes the session baseline:
    `roofline` is the preferred composite path when enabled; it wraps
    profiling, trace analysis, and `analysis.md` snapshot publication.
 
+The `roofline` executor makes no LLM call of its own. It runs the profile and
+the TraceLens analysis, and stores TraceLens's report (`analysis.md`, or
+`analysis.json` when the session analyses traces without an LLM) verbatim with
+the snapshot; Orchestration reads that report through the `show_analysis_md`
+context tool.
+
 `model_class` is supplied by the launcher or derived once from model
 metadata at boot. There is no separate live `classify` action.
 
@@ -141,7 +147,11 @@ A KEEP in ENABLEMENT is graded on runnability and the accuracy floor, not
 throughput. The phase exits normally when `baseline_tput > 0`, the
 revalidation window is closed, and all in-flight enablement work is drained.
 It exits terminally on `server_argv_invalid`, `environment_fault`, or
-`enablement_attempts_exhausted` (eight consecutive failed rounds).
+`enablement_attempts_exhausted` (eight consecutive failed rounds). Under
+`--no-source-changes` it also exits on
+`enablement_blocked_by_no_source_changes`, at the first round whose fix is a
+source, file or runtime change: the session refuses that fix, and another round
+would author one that is refused again.
 
 Only the enablement lane authors rounds here; the LLM proposes `target_analysis`.
 A round that reaches its executor after the lane stopped taking rounds is skipped.
@@ -177,17 +187,18 @@ text, built by `build_enablement_ladder_book` in
 `hyperloom.orchestrator.enablement.mandate` and injected into the enablement
 authoring specialist's prompt. The rungs, in increasing complexity:
 
-0. **Rung 0 — diagnose / capability-gap localization.** Read-only:
+- **Rung 0 — diagnose / capability-gap localization.** Read-only:
    classify the failure, read `config.json`, check the supported-arch registry
    and version, and look up upstream. Output: the missing layer and the entry
    rung.
-1. **Rung 1 — serve-flag / config wire-up.** The architecture is supported and
+- **Rung 1 — serve-flag / config wire-up.** The architecture is supported and
    only a serve flag / env / tokenizer-mode / trivial registration alias is
    missing. No new code or dependencies.
-2. **Rung 2 — in-tree source patch.** A unified diff against the source tree
+- **Rung 2 — in-tree source patch.** A unified diff against the source tree
    the server imports: register the arch, a small forward/config/tokenizer
-   bridge, or backport a merged PR. Pure Python, no compile.
-3. **Rung 3 — attempt-scoped runtime.** The specialist names the version
+   bridge, or backport a merged PR. Pure Python, no compile; a change that
+   touches compiled or build-backend files is left to Rung 5.
+- **Rung 3 — attempt-scoped runtime.** The specialist names the version
    that carries the fix as a `needs_runtime` request in its
    `specialist_done`: a framework ref (PR, tag, branch or sha) installed
    editable, pip packages, or both. No operator setting or failure kind
@@ -202,17 +213,10 @@ authoring specialist's prompt. The rungs, in increasing complexity:
    process environment to point at an attempt runtime. While one is active,
    the source tree the server imports is that runtime's own — the editable
    checkout, or the venv's site-packages when the framework itself was
-   installed there — so Rung 2 and Rung 4 patches land there. A kept runtime
+   installed there — so Rung 2 patches land there. A kept runtime
    is re-provisioned for every later round, whatever that round's failure or
    request.
-4. **Rung 4 — source localization.** Localize a merged-PR or vendored
-   closure into the source tree the server imports. Only the files under the
-   framework's package are localized. A change that touches compiled or
-   build-backend files cannot be satisfied by a plain source edit, and one
-   that is oversize or does not apply to the tree is not backported either;
-   in each case the round runs on its own patches, and a compiled gap is
-   left to Rung 5.
-5. **Rung 5 — off-loop compiled build.** Perform a compiled-component build
+- **Rung 5 — off-loop compiled build.** Perform a compiled-component build
    (AITER kernels, sgl-kernel, or vLLM-from-source). Builds run *off* the
    coordinator tick loop on a dedicated single-slot build lane: each build
    is spawned detached and reaped across later ticks against a wall-clock
@@ -470,9 +474,7 @@ record counts as unmeasured. So does a round whose energy is not valid, such as
 one in which a configured card had no power reading (a 0 W or negative socket
 power, which no working sensor reports, reads as none): such cards are listed as
 `unread_gpus`, since a card missing from the readings would drop out of the
-total and escape its own limit. A GEAK replay boots its own server once per
-replica, so its phases are read from the server logs the replay writes, with
-the same markers, and each new log counts as a fresh boot.
+total and escape its own limit.
 
 The budgets are on average draw at the deployed cap, the shape of a
 power-provisioned rack where cards keep their full cap for headroom: the total
@@ -494,15 +496,18 @@ a genuine baseline revalidates it. Otherwise the build reverts, or, if the
 boot advanced past the original failure to a new or deeper gap, the loop
 advances to the next round to repair that gap.
 
-### Discovery-driven build refs
+### Build refs
 
-Candidate PR refs discovered by the framework-agent feed directly into the
-build: a PR reference becomes a checkout of that PR's head, not just a
-released-tag autoselect. This makes support that exists only in an
-unreleased PR or branch reachable. When a discovered PR ref drives the
+A specialist's build request names its ref: a PR reference becomes a checkout
+of that PR's head, not just a released-tag autoselect. This makes support that
+exists only in an unreleased PR or branch reachable. When a PR ref drives the
 build, the source PR URL is recorded as build provenance in the session
 breakdown's `installed_versions` map (`source_pr_url`); see the
 [`enablement` section](../reference/session-breakdown.md#enablement--admission-round-lifecycle-builds--attempt-runtimes).
+An auto-escalated build names no PR: it builds the ref of the runtime the
+session already kept, and otherwise names no ref. With no ref, the AITER build
+takes the newest tag that builds and imports; sgl-kernel and vLLM build the
+default branch.
 
 ### Novelty and crash safety
 
@@ -534,6 +539,46 @@ One phase, two levers worked in parallel:
   against this lever like an empty round, and explore benches the proposals
   for the configuration lever.
 
+A patch whose context an earlier KEEP moved is merged rather than dropped. On
+a git tree, a patch the strict `git apply` refuses, and that the tree does not
+already hold, is merged onto HEAD, which carries every KEEP so far: first with
+`git apply -3` (strategy `three_way`), then by keeping both sides of every
+conflict region whose merge base is empty (strategy `union_disjoint`). A union
+must keep every line the patch adds and, in a `.py` file, must parse and define
+no module-level name twice unless HEAD already does. A merged patch is
+benchmarked like any other and listed under `patches_merged` in the result,
+with its strategy and merge steps. A region where both sides changed the same
+lines is declined, never resolved: the files the merge touched are restored to
+HEAD and the round ends `apply_failed`, its `error` carrying the strict apply
+error plus the merge steps. A `perf_framework` or `perf_explore` patch is then
+re-authored on the kept stack, within the authored-lane retry cap. A tree that
+is not a git checkout has no merge step: a patch that does not apply ends the
+round `apply_failed`.
+
+`--no-source-changes` keeps the second lever to launch configuration: every
+route that can change a source tree or the installed environment lands through
+`integrate_patch`, which skips such a round (`skipped_reason=no_source_changes`)
+before anything is applied. A server argument or environment variable whose
+value names a file under the session directory is such a change, since the file
+is what would be kept: `integrate_patch` skips that round, and an `explore`
+whose grid holds such a variant is denied at admission
+(`explore_names_session_file`). Specialists still run and their configuration
+proposals are still benched, but work only that gate would refuse is not
+started: a specialist that would author a patch without a bench loop runs as
+read-only research, no targeted build is started, and an upstream pull request's
+own diff is not queued (a candidate with no authoring route ends `skipped`).
+Framework authoring rounds (an upstream-PR port, the local-exploration arm)
+still run and are told only configuration is kept: a patch they deliver is
+skipped by that gate, a configuration proposal is benched.
+`--no-framework-local-explore` remains the switch that saves the
+local-exploration arm's budget. The kernel phase and the PRELUDE warm replay
+never reach that gate, so the flag turns both off as well, as `--no-kernel` and
+`--no-warm-replay` do: the one flag gives a result that holds only server
+arguments and environment variables. Passed on a resume, the flag holds from
+that leg on and removes nothing the session kept before it: a source patch stays
+on the stack, and a session that kept an install or a runtime in enablement has
+its next enablement round refused.
+
 `specialist` serves both levers — investigation, patch authoring, and
 candidate discovery are all dispatches of the one specialist action. An
 operator can add one domain of their own, `custom_specialist`, whose focus is
@@ -541,6 +586,24 @@ the text they supply at launch. The Coordinator alone dispatches it, once per
 macro cycle on entering this phase; it and the grid benching its proposals run
 ahead of all other queued work, and a plateau exit waits for both within the
 phase budget.
+
+Under the Claude CLI a specialist runs with
+`--permission-mode bypassPermissions`, because a permission prompt in an
+unattended run would wait without output until the run is reaped as stale. It
+gets every built-in tool except `KillShell` and `SlashCommand`, which
+`--disallowedTools` removes to back the prompt rule against global process
+cleanup; Codex and dsh have no equivalent of that denylist. Only its worktree
+and its task workspace are
+passed as `--add-dir` entries. It loads no user, project or local settings
+(`--setting-sources=`), so the hooks, permissions and env in the operator's
+`~/.claude/settings.json` or a checkout's `.claude/` do not reach it. None of
+these flags is filesystem containment. What the process can read and write is
+decided by the isolation its launch runs under: another account, a bubblewrap
+sandbox, or unconfined where neither works (see
+[Agent isolation](../reference/environment-variables.md#agent-isolation)).
+Whichever applies, the prompt rules send every patch through `integrate_patch`,
+never straight into a source tree, and PolicyGate admits an `integrate_patch`
+of a specialist's patch only on a Critic verdict of `approve` or `advise`.
 
 With a [PrimaTune](../reference/primatune-predictor.md) endpoint configured,
 the phase also asks that predictor for a launch recipe once per decision point:
@@ -611,8 +674,8 @@ are:
 - `roofline`
 - `profile`
 
-`kernel_agent` is Coordinator-internal; PolicyGate rejects it with
-`rule="coordinator_managed_action"` if an LLM proposes it.
+`kernel_agent` is Coordinator-internal; admission rejects it with
+`rule="phase_incompatible"` if an LLM proposes it.
 
 Within the kernel-agent request channel, the handler dispatches request kinds
 such as `trace_analyze` and `integrate`
@@ -623,48 +686,23 @@ attempts. A KEEP must be integrated before the run can proceed to final
 reporting, and hot reusable kernels above the configured threshold must
 be attempted or explicitly rejected before report can close the run.
 
-## SWEEP
+## CYCLE_END
 
-SWEEP measures the optimized stack against the baseline across a
-concurrency ladder, one arm each, and produces the throughput-vs-
-interactivity curve. The ladder is sized for the workload: powers of two
-down from 256 for a synthetic run, `1,4,8,10,14,20,28` for an agentic one,
-where a request carries orders of magnitude more prompt and the same card
-saturates far lower. Override either with `--conc-sweep-concs`. Under
-native AgentX, concurrency is fixed for the session and
-`--enable-conc-sweep` is rejected at startup. Start a separate session for each
-CONC. The independent MLPerf backend keeps its optional sweep, disabled by
-default. See the [AgentX workflow](../how-to/optimize.md#optimize-an-agentx-workload)
-for supported workload controls.
+CYCLE_END closes each macro-cycle. On entry it settles any stack attempt an
+earlier leg left behind, integrates pending kernel KEEPs, and validates the
+stack for positive `NEEDS_REVIEW` kernels, then records the cycle as settled
+(`cycle_end_settled_cycle`). A settled CYCLE_END exits on the next phase
+decision (`cycle_end_done`), either looping back or closing on the reason
+below. CYCLE_END has no phase budget of its own: the session budget alone
+gates its entry work. A resumed session that stopped inside the entry work
+re-runs it once, on the resumed process's first phase decision.
 
-Each arm runs the session's own CONC first, then the rest of the ladder
-cheapest first: low to high for a synthetic workload, whose rungs send requests
-in proportion to CONC, and high to low for an agentic one, whose rungs replay a
-fixed set of trajectories on more lanes the higher CONC goes.
-A pair needs both arms, so the baseline arm runs first: its first rung may use
-the whole budget, and each later rung must fit in half of what was left when
-the arm started. The optimized arm then runs only the concurrencies the
-baseline reached. A budget that runs out therefore drops whole pairs, and the
-anchor pair is the last one it drops. A rung is not started once the time left
-is shorter than the last benchmark measured after the anchor, since none past
-it runs faster. SWEEP dispatches the sweep only when the time it can grant holds
-one pair: two of the session's measured baseline rounds.
-
-Results update `last_conc_sweep` and feed the final report and breakdown.
-A ladder that fails closes the phase as `sweep_failed`; one that finishes
-(`sweep_done`) loops back or closes on the reason below. While the sweep it
-enqueued is still running, SWEEP's own budget and cap wait for the budget the
-sweep was granted (plus its lease grace); the session deadline does not. A
-sweep the orchestrator cancels stops its ladder at once and records
-`cancelled`, so the phase closes on whatever ordered the cancel rather than on
-`sweep_failed`.
-
-When SWEEP does not loop back, the close names what refused the next
+When CYCLE_END does not loop back, the close names what refused the next
 macro-cycle: `target_reached`, `global_converged` (consecutive cycles without
 gain, or every direction saturated) or `time_exhausted` (less session time
 left than the reloop floor). The refusing rule is kept in the transition
 evidence as `reloop_blocked`. A run without `FRAMEWORK_AGENT` has no next
-cycle to refuse, so it closes on the ladder's own reason unless the target was
+cycle to refuse, so it closes as `cycle_end_done` unless the target was
 reached.
 
 ## CLOSE
@@ -684,11 +722,11 @@ a resumed run.
 
 Every Orchestration turn is stateless: the Coordinator composes one
 unconditional full state projection (mission, `SharedState`, gaps,
-warm-start, scores, the tasks in flight with each explore round's grid,
+warm-start, the tasks in flight with each explore round's grid,
 and the inbox events since the last turn), so the turn never depends on
 what an earlier turn happened to remember.
 
-- **Cycle directive**: While SWEEP is open and another macro-cycle is
+- **Cycle directive**: While CYCLE_END is open and another macro-cycle is
   still feasible, the Coordinator appends one handoff request to an ordinary
   Orchestration turn. The reply, plain text and no intent required, is stored
   as `orchestration_memory` (`next_cycle_directive`, `for_cycle`,
@@ -697,8 +735,8 @@ what an earlier turn happened to remember.
 - **Context tools**: A read-only MCP surface lets the agent pull what the
   projection leaves out — finished outcomes (`get_recent_outcomes`),
   a mid-turn re-read of in-flight work (`get_running_tasks`), failure packets (`get_failure` /
-  `get_variant_failures`), reference docs (`read_reference`), the raw
-  `analysis.md` (`show_analysis_md`), denial history (`why_denied`) — plus
+  `get_variant_failures`), reference docs (`read_reference`) and the raw
+  `analysis.md` (`show_analysis_md`).
   Transports without MCP tools get the projection only.
 - **Resume**: On resume the projection is rebuilt from
   `orchestration_memory` plus the authoritative `SharedState` facts —

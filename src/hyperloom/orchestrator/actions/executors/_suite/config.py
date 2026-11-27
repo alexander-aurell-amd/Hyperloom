@@ -11,9 +11,10 @@ that layer. What the YAML does
 not hold -- where the round writes, its interpreter, lifecycle and telemetry -- comes in :class:`RoundSettings`.
 
 An AgentX point runs the agentx-harness replay on the launch its ``agentx.launch_overrides`` composed on the session
-base, above the base's golden layer; a profile point turns the torch profiler on for the window it asks for. An MLPerf
-point (``benchmark_script`` names the MLPerf agentic client) runs the MLPerf harness against the round's own server,
-which serves under the model name the harness requests.
+base, above the base's golden layer; a profile point turns the torch profiler on for the window it asks for, its
+environment over the server environment of the framework's shipped profile configuration, as a fixed-sequence profile
+point's is. An MLPerf point (``benchmark_script`` names the MLPerf agentic client) runs the MLPerf harness against the
+round's own server, which serves under the model name the harness requests.
 
 A scriptable point (xDiT, or a custom session's own benchmark and eval scripts) runs its session base's script once
 with the point's environment (:func:`scriptable_workload`); the quality gate the script writes is its eval, so it
@@ -33,14 +34,19 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
+import yaml
+
 from hyperloom_common.env import is_truthy
 from hyperloom.common.agentx_workload import (
+    AGENTX_TRACE_ENV,
     CANON_WARMUP_PER_LANE,
+    agentx_trace,
     is_agentx_client_key,
     is_agentx_client_script,
 )
 from hyperloom.common.benchmark_config import AgentxLaunch, BenchmarkPoint, is_agentx
 from hyperloom.common.gain_math import AGENTX_ERROR_RATE_THRESHOLD_PCT
+from hyperloom.common.perf_metric import DATASET_PATH_ENV
 from hyperloom.common.outside_facts import (
     ENV_CONC,
     ENV_EP,
@@ -57,7 +63,8 @@ from hyperloom.common.outside_facts import (
     ENV_TP,
 )
 from hyperloom.inference_optimizer.framework_paths import KERNEL_LIBRARY_PACKAGES
-from hyperloom.inference_optimizer.framework_registry import extra_args_env
+from hyperloom.inference_optimizer.framework_registry import extra_args_env, shipped_config_name
+from hyperloom.inference_optimizer.session.paths import asset_root
 from inference_suite.argv import argv_flag_occurrences, canonical_flag_name, normalize_argv, remove_server_args
 from inference_suite.contracts import (
     AGENTX_CLIENT_ENV_PREFIX,
@@ -79,6 +86,7 @@ from inference_suite.contracts import (
     LifecycleMode,
     MlperfWorkload,
     ProfileConfig,
+    PromptDataset,
     RunPaths,
     ScriptableRunEnv,
     ScriptableWorkload,
@@ -89,8 +97,8 @@ from inference_suite.contracts import (
 )
 from inference_suite.frameworks import Framework, FrameworkKind, framework_facts
 
-from .._gpu_pin import ROCR_AUTOFILL_ENV
-from .._workload_envs import QUALITY_REF_ENVS
+from ..gpu._gpu_pin import ROCR_AUTOFILL_ENV
+from ..workload._workload_envs import QUALITY_REF_ENVS
 from .._profile_setup import (
     _DELAY_ITERATIONS,
     _MAX_ITERATIONS,
@@ -157,6 +165,7 @@ _CONSUMED_ENV = frozenset(
         _REMOTE_SERVER_ENV,
         _PROFILE_ENV,
         _PROFILE_BODY_ENV,
+        DATASET_PATH_ENV,
     }
 )
 
@@ -187,6 +196,9 @@ class RoundSettings:
     ``base_path`` is where the frozen base the round composes on is stored; ``silence_sec`` bounds how long the
     server may log nothing once ready; ``env_inherit`` names the host environment the server and client may see;
     ``server_url`` is the server a client-only round measures, which a point's own ``BENCHMARK_BASE_URL`` overrides.
+    ``server_cpus`` are the CPUs the round's server is pinned to (empty: the round's own).
+    ``boot_budget_sec`` is the boot budget of the test the round belongs to (``Deadlines.boot_budget_sec``), ``None``
+    for none.
     """
 
     base_path: str
@@ -198,6 +210,8 @@ class RoundSettings:
     env_inherit: tuple[str, ...] = ()
     deadline_unix: int | None = None
     server_url: str | None = None
+    server_cpus: tuple[int, ...] = ()
+    boot_budget_sec: float | None = None
 
 
 @dataclass(frozen=True)
@@ -281,9 +295,9 @@ def _user_args(point: _Point) -> tuple[str, ...]:
     extra = tuple((point.text(extra_args_env(point.framework.value)) or "").split())
     flags = {name for name, _ in argv_flag_occurrences(extra)}
     added: tuple[str, ...] = ()
-    context_flag = framework_facts(point.framework).server_flags.context_length
-    if point.framework in _LAUNCHER_CONTEXT_LENGTH and canonical_flag_name(context_flag) not in flags:
-        added = (context_flag, str(point.integer(ENV_MAX_MODEL_LEN, _LAUNCHER_MAX_MODEL_LEN)))
+    context = framework_facts(point.framework).server_flags.context_length
+    if point.framework in _LAUNCHER_CONTEXT_LENGTH and context.value(extra) is None:
+        added = (context.aliases[0], str(point.integer(ENV_MAX_MODEL_LEN, _LAUNCHER_MAX_MODEL_LEN)))
     conflicts = _LAUNCHER_CONFLICTS.get(point.framework, ())
     dropped = [drop for need, drop in conflicts if canonical_flag_name(need) in flags]
     if dropped:
@@ -336,10 +350,22 @@ def _user_layer(point: _Point, base: BaseLaunch) -> LaunchDelta:
     args_add = _user_args(point)
     ran = {name for name, _ in argv_flag_occurrences(args_add)}
     dropped = tuple(f"--{name}" for name in _flag_groups(base.args) if name not in ran)
+    unset = tuple(sorted(name for name, value in base.env.items() if isinstance(value, str) and name not in point.envs))
+    return LaunchDelta(args_add=args_add, args_remove=dropped, env_set=_server_env(point), env_unset=unset)
+
+
+def _server_env(point: _Point) -> dict[str, str]:
+    """The point's environment its server sees: less the knobs the config carries as fields and its server args."""
     env = {name: value for name, value in point.envs.items() if name not in _CONSUMED_ENV}
     env.pop(extra_args_env(point.framework.value), None)
-    unset = tuple(sorted(name for name, value in base.env.items() if isinstance(value, str) and name not in point.envs))
-    return LaunchDelta(args_add=args_add, args_remove=dropped, env_set=env, env_unset=unset)
+    return env
+
+
+def _shipped_profile_env(framework: Framework) -> dict[str, str]:
+    """The server environment of ``framework``'s shipped profile configuration, which a fixed-sequence profile point is
+    rendered from."""
+    path = asset_root() / "assets" / "configs" / shipped_config_name("profile", framework.value)
+    return _server_env(_point_of(_bench(yaml.safe_load(path.read_text(encoding=_UTF8))), 0.0, 0.0))
 
 
 def _server(
@@ -358,6 +384,7 @@ def _server(
         user=user,
         import_packages=KERNEL_LIBRARY_PACKAGES,
         env_inherit=settings.env_inherit,
+        cpus=settings.server_cpus,
     )
 
 
@@ -367,6 +394,7 @@ def fixed_workload(document: Mapping[str, object]) -> FixedWorkload:
 
 
 def _fixed(point: _Point) -> FixedWorkload:
+    dataset = point.text(DATASET_PATH_ENV)
     return FixedWorkload(
         concurrency=point.integer(ENV_CONC),
         isl=point.integer(ENV_ISL),
@@ -378,6 +406,7 @@ def _fixed(point: _Point) -> FixedWorkload:
         warmup_seed=WARMUP_SEED,
         tokenizer_mode=point.text(_TOKENIZER_MODE_ENV) or _CLIENT_TOKENIZER_MODE,
         trust_remote_code=point.flag(_CLIENT_TRUST_ENV, default=False),
+        dataset=None if dataset is None else PromptDataset(dataset),
     )
 
 
@@ -455,7 +484,7 @@ _AGENTX_LAUNCH_KEYS = frozenset(
 )
 _AGENTX_CANONICAL = "canonical"
 _AGENTX_THRESHOLD = AGENTX_ERROR_RATE_THRESHOLD_PCT / 100
-_TRACE_ENV = "WEKA_LOADER_OVERRIDE"
+_TRACE_ENV = AGENTX_TRACE_ENV
 _DURATION_ENV = "DURATION"
 _EP_SIZE_ENV = "EP_SIZE"
 _WARMUP_PER_LANE_ENV = "AIPERF_WARMUP_REQUESTS_PER_LANE"
@@ -510,7 +539,7 @@ def _lane_warmup(client_env: Mapping[str, str]) -> int:
 
 
 def _agentx_trace(point: _Point, base: BaseLaunch) -> str:
-    trace = point.text(_TRACE_ENV) or base.client.env.get(_TRACE_ENV)
+    trace = agentx_trace(point.envs, base.client.env)
     if trace is None:
         raise ConfigError(f"neither the AgentX point nor its base's client env names the trace corpus ({_TRACE_ENV})")
     return trace
@@ -564,6 +593,8 @@ def _agentx_config(
     _check_agentx_envs(point, base)
     point = replace(point, model=point.text(_MODEL_PATH_ENV) or point.model)
     measures = not boot_only
+    if measures and torch_profiler(bench).get("enabled"):
+        point = replace(point, envs={**_shipped_profile_env(point.framework), **point.envs})
     if settings.server_url is not None:
         settings = _measuring_external(settings)
     server = _agentx_server(point, bench, base, settings)
@@ -789,6 +820,7 @@ def _deadlines(point: _Point, settings: RoundSettings) -> Deadlines:
         eval_sec=point.timeout_sec,
         silence_sec=settings.silence_sec,
         deadline_unix=settings.deadline_unix,
+        boot_budget_sec=settings.boot_budget_sec,
     )
 
 

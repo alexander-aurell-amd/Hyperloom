@@ -18,16 +18,22 @@ def print_lineup_banners(args: argparse.Namespace, *, no_kernel: bool, no_framew
     if no_framework_agent:
         print(
             "Optimize phase  : DISABLED (--no-framework-agent); "
-            f"{'baseline -> SWEEP' if no_kernel else 'baseline -> KERNEL -> SWEEP'}"
+            f"{'baseline -> CYCLE_END' if no_kernel else 'baseline -> KERNEL -> CYCLE_END'}"
         )
     else:
         print("Optimize phase  : ENABLED")
+    if bool(getattr(args, "no_source_changes", False)):
+        print(
+            "Source changes  : SKIPPED (--no-source-changes); a round that carries more than "
+            "server arguments and environment variables is not kept, and the kernel phase "
+            "and the warm replay are off"
+        )
     if no_framework_agent and no_kernel:
         print(
             "WARNING: --no-framework-agent and --no-kernel are both set; the "
-            "run collapses to baseline -> SWEEP over an empty "
+            "run collapses to baseline -> CYCLE_END over an empty "
             "optimization_stack (no config or source search, no KERNEL "
-            "rewrites). SWEEP only re-validates the baseline recipe. "
+            "rewrites). CYCLE_END only settles that empty stack and measures nothing. "
             "Continuing as requested.",
             file=sys.stderr,
         )

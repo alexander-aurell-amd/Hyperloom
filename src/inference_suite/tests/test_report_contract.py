@@ -12,7 +12,7 @@ from dataclasses import replace
 
 import pytest
 
-from hyperloom.orchestrator.actions.executors._gpu_metrics import gpu_metrics_from_report
+from hyperloom.orchestrator.actions.executors.gpu._gpu_metrics import gpu_metrics_from_report
 from inference_suite.contracts import (
     AGENTX_CONTEXT_OVERFLOW,
     FIXED_METRIC_KEYS,
@@ -185,6 +185,7 @@ def test_failed_step_is_a_closed_list() -> None:
         "client_failed",
         "client_output_missing",
         "eval_failed",
+        "profile_refused",
         "round_timeout",
         "deadline_exhausted",
         "cancelled",

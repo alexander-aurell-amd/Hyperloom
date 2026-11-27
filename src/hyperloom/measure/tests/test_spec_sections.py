@@ -12,6 +12,7 @@ from dataclasses import replace
 import pytest
 import yaml
 
+from hyperloom_common.gpu_card import GpuCard
 from hyperloom.common.agentx_early_stop import EarlyStopMode
 from hyperloom.measure.checkpoint import CheckpointPlan
 from hyperloom.measure.hosted_spec import SpecRefused, build_spec
@@ -140,6 +141,14 @@ def test_a_sheet_carries_the_silence_timeout_and_the_deadline_it_was_given(tmp_p
     assert (procedure.timeout_sec, procedure.silence_timeout_sec, procedure.deadline_unix) == (90.0, 30.0, 1234.0)
 
 
+def test_the_sheet_carries_the_boot_budget_it_was_given_and_none_otherwise(tmp_path):
+    given = _procedure(tmp_path, boot_budget_sec=5400)
+
+    assert given.boot_budget_sec == 5400.0 and given.to_document()["boot_budget_sec"] == 5400.0
+    assert _procedure(tmp_path).boot_budget_sec is None
+    assert "boot_budget_sec" not in _procedure(tmp_path).to_document(), "a sheet without one reads as it always did"
+
+
 def test_the_sheet_holds_the_measured_round_to_the_checkpoint_it_was_given_and_to_none_otherwise(tmp_path):
     plan = CheckpointPlan(50.0, EarlyStopMode.ENFORCE)
 
@@ -156,6 +165,17 @@ def test_the_sheet_asks_for_as_many_gpus_as_the_first_point_has_tensor_parallel_
     sheet = _build(tmp_path, point_yaml(tmp_path, tp=4))
 
     assert sheet.hardware.gpu_count == 4
+
+
+def test_the_sheet_carries_the_session_s_card_and_says_so_when_the_session_read_none(tmp_path):
+    card = GpuCard("AMD Instinct MI325X", "74a5", "gfx942", 304, 262128, 6144.0, 2100)
+    call = make_call(tmp_path)
+
+    carried = build_spec(call, request_id="req-1", ctx=spec_context(tmp_path, card=card), deadline_unix=1234.0)
+    without = build_spec(call, request_id="req-1", ctx=spec_context(tmp_path), deadline_unix=1234.0)
+
+    assert carried.hardware.card == card
+    assert without.hardware.card is None and without.to_document()["hardware"]["card"] is None
 
 
 @pytest.mark.parametrize("text", ["other: {}\n", "benchmark:\n  envs: [TP]\n", "benchmark:\n  envs:\n    TP: x\n"])

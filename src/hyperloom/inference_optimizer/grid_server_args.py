@@ -59,6 +59,37 @@ def validate_server_args_shell_safe(server_args: str | None) -> str:
     return args
 
 
+def server_arg_groups(server_args: str | None) -> dict[str, list[str]]:
+    """Each flag ``server_args`` names, by canonical name, as its tokens: the flag and the values after it; a later
+    copy of a flag replaces an earlier one, as the engine's parser lets it."""
+    groups: dict[str, list[str]] = {}
+    current: list[str] | None = None
+    for token in _argv_tokens(server_args):
+        if _argv.is_flag(token):
+            current = [token]
+            groups[_argv.canonical_flag_name(token.partition("=")[0])] = current
+        elif current is not None:
+            current.append(token)
+    return groups
+
+
+@dataclass(frozen=True)
+class ServerArgsDelta:
+    """What takes one argv to another: the flags to set, each with its values, and the flags to remove."""
+
+    add: str = ""
+    remove: tuple[str, ...] = ()
+
+
+def server_args_delta(before: str | None, after: str | None) -> ServerArgsDelta:
+    """The change from ``before`` to ``after``: every flag ``after`` sets differently or ``before`` lacks, and every flag
+    ``before`` names that ``after`` does not."""
+    old, new = server_arg_groups(before), server_arg_groups(after)
+    add = [" ".join(tokens) for name, tokens in new.items() if old.get(name) != tokens]
+    remove = tuple(tokens[0].partition("=")[0] for name, tokens in old.items() if name not in new)
+    return ServerArgsDelta(" ".join(add), remove)
+
+
 def merge_server_args(*parts: str | None) -> str:
     """Merge server arg strings preserving left-to-right override semantics."""
     return " ".join(str(p).strip() for p in parts if str(p or "").strip())
@@ -104,6 +135,29 @@ def without_runner_owned(server_args: str | None, owned: RunnerOwned) -> str:
     return _argv.remove_server_args(
         server_args, sorted(flag for flag in spellings if _argv.canonical_flag_name(flag) in names)
     )
+
+
+def _argv_tokens(server_args: str | None) -> list[str]:
+    args = _argv.reserialize_json_blobs(str(server_args or "").strip())
+    tokens = _argv.split_args_preserving_json(args)
+    return args.split() if tokens is None else tokens
+
+
+def base_args_not_restated(base_args: str | None, server_args: str | None) -> str:
+    """The flags of ``base_args``, each with its values and in order, that ``server_args`` does not name in any spelling.
+
+    ``server_args`` sits above the base, so a flag it names already wins over the base's copy; a config materialized
+    once carries the whole base, and seeding the base under it again would only stack a copy per re-materialization.
+    """
+    named = {name for name, _ in _argv.argv_flag_occurrences(_argv_tokens(server_args))}
+    kept: list[str] = []
+    keeping = True
+    for token in _argv_tokens(base_args):
+        if _argv.is_flag(token):
+            keeping = _argv.canonical_flag_name(token.partition("=")[0]) not in named
+        if keeping:
+            kept.append(token)
+    return " ".join(kept)
 
 
 def normalize_server_args(server_args: str | None) -> str:
@@ -501,10 +555,10 @@ def inject_sglang_context_length(
         return args
     # AgentX replays a fixed trace corpus, so ISL/OSL are placeholders here and the ISL+OSL+headroom ceiling (8192 at
     # the 1024/1024 defaults) would pin sglang's window two orders of magnitude below what the corpus needs -- every
-    # oversized trace then 4xxs.
-    from hyperloom.common.perf_metric import agentx_enabled
+    # oversized trace then 4xxs. A prompt dataset is the same case.
+    from hyperloom.common.perf_metric import request_lengths_from_data
 
-    if agentx_enabled():
+    if request_lengths_from_data():
         context_length = int(max_pos)
     else:
         context_length = min(int(max_pos), resolve_sglang_context_cap(window.isl, window.osl))
@@ -549,15 +603,14 @@ def inject_sglang_attention_backend(
 # sglang/ROCm images, verified end-to-end on a real MoE checkpoint.
 # ``moe_runner_requires_aiter`` below strips an *inherited*
 # ``--moe-runner-backend`` that would crash an aiter-only quant scheme (grid
-# variants, baseline retries).
+# variants).
 #
 # Matches space- or equals-separated form without false-matching a longer flag.
 SGLANG_MOE_RUNNER_BACKEND_RE = re.compile(r"--moe-runner-backend(?:[=\s]|$)")
 
 # Same flag with the value that follows it, so a removal takes the pair and not just the name.
 # The value is optional so a bare, value-less flag (an operator typo, or a flag left dangling at
-# end-of-string) is stripped too rather than surviving into a retry that is supposed to launch
-# without it.
+# end-of-string) is stripped too.
 _SGLANG_MOE_RUNNER_BACKEND_PAIR_RE = re.compile(r"(?:^|\s)--moe-runner-backend(?:(?:[=\s]+)(?!--)\S+)?")
 
 

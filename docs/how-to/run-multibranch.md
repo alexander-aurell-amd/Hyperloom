@@ -2,7 +2,7 @@
 myst:
     html_meta:
         "description": "Run a multi-branch Hyperloom session with hyperloom-multibranch run: the environment it needs, its options grouped by what they control, and its exit codes."
-        "keywords": "Hyperloom, multi-branch, MB, hyperloom-multibranch, run, RSI archive, runner cache, image check, Recipe KB"
+        "keywords": "Hyperloom, multi-branch, MB, hyperloom-multibranch, run, RSI archive, runner cache, Recipe KB"
 ---
 # Running a multi-branch session
 
@@ -25,18 +25,22 @@ The session directory is created under `USER_DATA_PATH` and its path is printed 
 ## Environment
 
 Every variable below is checked before anything is created: a missing or malformed one fails the command with no
-session directory left behind. Two steps run later, in the new session before PRELUDE: the image check, and on a local
-session the publish of the inference_suite staging into the runner cache, which fails the command (exit 1) with the
-session directory left behind when that directory cannot be written.
+session directory left behind. Two steps run later, in the new session before PRELUDE: the read of
+the session's card (from the machine, or the recording `HYPERLOOM_RUNNER_GPU_CARD` names with `--measurement
+hosted`), which fails the command (exit 1) with the session directory left behind when the cards cannot be described
+or are not one kind; and on a local session the publish of the inference_suite staging into the runner cache, which
+fails it the same way when that directory cannot be written.
 
 | Variable | Required | Meaning |
 | --- | --- | --- |
 | `HYPERLOOM_RSI_ARCHIVE` | yes | Writable shared directory the session reads its predecessors from and archives its search tree in. No default. |
 | `HYPERLOOM_RUNNER_CACHE` | with `--measurement hosted` | This host's runner cache directory, which holds the inference_suite staging every test runs. Hosted: an absolute path on storage the measurement sandboxes mount, no default. Local: `/runner-cache` when unset, and it must be writable. |
-| `HYPERLOOM_IMAGE_CHECK` | no | `warn` (default) logs a failing fact of the rule pack about the image, `strict` fails the command before PRELUDE (exit 1), `off` checks nothing. Any other value is a usage error. |
+| `HYPERLOOM_RUNNER_GPU_CARD` | with `--measurement hosted` | A recording of `amd-smi static --json` on a node the measurement sandboxes run on, which the session takes its card from (see `--gpu-type` below and [Run hosted multi-branch on a new cluster](hosted-multibranch-new-cluster.md#app-host)). Read in the new session, as said above. A local session reads its own cards and ignores it. |
 | `INFERENCE_SUITE_TOOL_CACHE` | no | The tool cache `install.sh` staged the pinned InferenceX client in, which every test runs. Default `inference-suite-tools` under the dependency cache. Without a staging there that verifies, the command fails, naming `python -m inference_suite stage --tool-cache <dir>`. |
 | `KB_STORE_URL`, `KB_STORE_TOKEN` | no | Both set: PRELUDE reads warm-start leads from the Recipe KB and CLOSE writes the final recipe back. Neither set: no Recipe KB. Only one set is refused. |
+| `HYPERLOOM_KB_URL`, `HYPERLOOM_KB_TOKEN` | no | The Experience KB: the workspace's loopback service, whose URL and token `hyperloom-setup` writes into the workspace `.env`. Export them as the other variables here: `hyperloom-multibranch` reads no `.env`. Set: the briefs and the learnings tool recall past sessions' tests and learnings from it, and CLOSE writes this session's there; what the service does not take waits in the spool beside its data. A loopback service that is not serving is started before the session and left serving after it; one serving with other settings is not restarted. A service that cannot start, or a URL without its token, logs a warning and the session runs without it. Unset: no Experience KB. |
 | `HYPERLOOM_AGENTX_EARLY_STOP` | no | AgentX checkpoint mode: `shadow` (default here), `enforce` or `off`. Read once when the session starts and kept in `MB-manifest.json`, so a resumed session keeps it. Any other value is a usage error. |
+| `GITHUB_TOKEN` | no | Not checked when the session starts. The GitHub token this process asks GitHub with when a specialist searches an upstream repository's pull requests. `GH_TOKEN` is read when it is unset. Without either the session runs, logs one WARNING when its toolbox is built and asks GitHub anonymously, which GitHub refuses once the address's small quota is spent. See [Upstream pull-request search](#upstream-pull-request-search). |
 
 The short-prompt and long-context consistency checks are on by default and, when a test runs them, run on its own
 server, reading a prompt set staged in this host's runner cache (`HYPERLOOM_RUNNER_CACHE`). `HYPERLOOM_SHORT_PROMPTS`
@@ -73,6 +77,74 @@ where a GPU is seen, a missing module, a `NameError`) is logged and not judged, 
 (`smoke_not_run`), retried once. `HYPERLOOM_MERGE_SMOKE=off` in the session's environment turns it off; any
 value but `on`, `off` or empty is refused when the toolbox is built.
 
+## Upstream pull-request search
+
+A specialist of a session measured on this machine's cards (`--measurement local`) can search the pull requests of
+its component's upstream repository (`upstream_pr_search`), to learn of a change upstream already has before it
+writes one. The repositories are the ones the rule pack names: sgl-project/sglang,
+vllm-project/vllm, ROCm/aiter, pytorch/pytorch and ggml-org/llama.cpp. The session's own process asks GitHub, with
+the token in its environment.
+
+The token is not in the environment of a specialist's CLI or of a measurement, and no result or error of the search
+and no line the session logs about it carries it. A dev sandbox or an agent sandbox that runs without bubblewrap
+starts from the session's environment, this token included. Where the session log says at its start that agents run
+unconfined on this host, an agent runs as this account and can read what the account can. That is why the token must
+be the one of step 1.
+
+To give the session a token:
+
+1. Create a token that can read public repositories and nothing else: a fine-grained personal access token with
+   repository access "Public repositories" (read-only) and no permission added, or a classic token with no scope
+   selected. Give it an expiry. Do not use the GitHub CLI's own token (`gh auth token`) or any token that reads a
+   private repository.
+2. Put it in the workspace `.env`, which git ignores, as `GITHUB_TOKEN=<token>`, on one line. Never commit it, and
+   never write it into a command: a command line is readable by every account of the machine.
+3. `hyperloom-multibranch` reads its process environment, not `.env`. Load `.env` into the shell that starts the
+   session:
+
+   ```bash
+   export REPO_ROOT="${REPO_ROOT:-$(pwd -P)}"
+   INSTALL_SH="$REPO_ROOT/hyperloom/inference_optimizer/assets/install.sh"
+   [ -f "$INSTALL_SH" ] || INSTALL_SH="$REPO_ROOT/src/hyperloom/inference_optimizer/assets/install.sh"
+   . "${INSTALL_SH%/*}/runtime_env.sh"
+   load_dotenv_no_clobber
+   ```
+
+   A `.env` another account can write lends no token, and the loader names the variable it refused. Read the token
+   into the shell there, without echo: `read -rs GITHUB_TOKEN && export GITHUB_TOKEN`.
+4. Check it before a long run, in the shell that will start the session. This prints `5000` with a token GitHub
+   accepts and `60` with none, and ends in `HTTP Error 401` for one GitHub rejects; the token is in no command line
+   and is not printed:
+
+   ```bash
+   python3 - <<'EOF'
+   import json, os, urllib.request
+   token = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or ""
+   ask = urllib.request.Request(
+       "https://api.github.com/rate_limit", headers={"Authorization": f"Bearer {token}"} if token else {}
+   )
+   print(json.load(urllib.request.urlopen(ask))["resources"]["core"]["limit"])
+   EOF
+   ```
+
+   The session's log then says `upstream PR search asks GitHub with this host's token` when its toolbox is built.
+
+With a token GitHub allows 30 searches a minute, for all the tokens of one account together; a search is one
+request. A search looks for the agent's keywords, words or phrases, of which only the first six are used, and finds
+the pull requests whose title, body or comments hold any one of them, open ones unless the agent names other states;
+it does not look at the paths a pull request changes.
+The search keeps up to `limit` candidates (10 by default, 20 at most), each with its number, title and URL, in the
+job's result record, with how many pull requests matched in all (`matched_prs`) and how many of them the limit left
+out (`not_shown`). The specialist is shown the job's summary: how many candidates were kept, of how many that matched
+when the limit left some out ("10 of 266"), and the number and title of the first. A GitHub that cannot be reached,
+a rejected token, a request the token is not allowed and a spent rate limit each fail the request with that reason,
+never with an empty list; a spent rate limit says how long to wait, and a request the token is not allowed says that
+asking again will not help.
+
+Without a token the requests are anonymous: GitHub allows an address 10 searches a minute, which a shared
+address has usually spent. A refused request then fails saying how long to wait and that the
+host has no token. The session logs one WARNING when its toolbox is built. Everything else runs as before.
+
 ## Options of `run`
 
 `hyperloom-multibranch run --help` has the full text of each option.
@@ -81,8 +153,16 @@ value but `on`, `off` or empty is refused when the toolbox is built.
   (expert-parallel size, default 1), `--conc`, `--precision`; `--isl`/`--osl` for `inferencex` only,
   `--agentx-duration-sec` (the trace window each test replays, the harness's default when not given) and
   `--agentx-objective` for `agentx` only; `--kernel-optimizer`;
+  `--boot-budget-sec` (see **Boot budget** below);
   `--inferencex-commit SHA` to resolve the session's base launch from InferenceX at that commit instead of `main`
   (see [Base launch](../reference/inference-suite.md#base-launch)).
+- **GPU type and card:** `--gpu-type` is the label the session files its results under (recipes, the Recipe KB, the
+  TraceLens arch spec the analyses read), in any case; any name is accepted. The facts come from the card itself: when
+  the session starts it reads the cards it measures on (`amd-smi`, else `rocm-smi`, else torch; in a hosted session,
+  the recording `HYPERLOOM_RUNNER_GPU_CARD` names) and every test's base launch, roofline and measurement sheet follow
+  that card's arch, compute units, memory and clocks. Cards of more than one kind, or cards no probe describes, refuse the
+  session before PRELUDE (exit 1), naming each kind. A `--gpu-type` other than the card's own label (`mi355x` for an
+  AMD Instinct MI355X) is kept and logged as a warning that names both.
 - **AgentX objective:** `--agentx-objective p50_interactivity|total_token_throughput` (default
   `p50_interactivity`) names the round metric an AgentX session keeps on: `e2e_norm_intvty_p50`, or
   `total_token_throughput` (per server; a session's TP is fixed, so it ranks changes as the per-GPU figure does). A
@@ -96,6 +176,15 @@ value but `on`, `off` or empty is refused when the toolbox is built.
   bar and guards are read from the code, so a resumed session judges by the current rule. The manifest records the
   objective, so a resumed session keeps it; the frontier, FINAL, the dashboard and `MB-report.md` all read that metric. A
   `total_token_throughput` session writes no Recipe KB record: the KB partitions by workload, not objective.
+- **Boot budget:** `--boot-budget-sec SECONDS` (a positive whole number, at most 21600, 6 h) is how long, at least, the
+  server of a test may take to be ready, for a model whose checkpoint takes long to load. Without it, a test's timeout
+  is 3600 s for `inferencex` and the trace window plus 3600 s for `agentx`, and a boot may take half of it. A budget
+  only lengthens both: a test runs for its trace window (`agentx`) plus 1800 s for the warmup, the measured rounds, the
+  accuracy evaluation and the drain, plus the budget, when that is longer than its default timeout; and the boot limit
+  (`server_boot_timeout`) is the budget when that is longer than half of the timeout. A budget of 1800 s or less
+  changes nothing. The server's own start timeout follows the budget: every round sets the framework's ready timeout
+  (`VLLM_ENGINE_READY_TIMEOUT_S`, `SGLANG_WARMUP_TIMEOUT`) to 10800 s, or to the budget plus 3600 s when that is
+  longer, so the server never gives up on a start the budget still allows.
 - **Base launch:** `--reference-script FILE`, a shell launch script or a base launch record frozen elsewhere, as for
   `hyperloom optimize`; the session freezes it as its base, a record without reading any recipe source. Without it
   the base comes from the recipe sources. Every component agent is served the frozen base unless `--agent-launch`
@@ -104,10 +193,9 @@ value but `on`, `off` or empty is refused when the toolbox is built.
   `--max-branches` (default 4). A negative or non-finite limit is a usage error.
 - **Concurrency:** `--max-parallel-tests` (default: as many as fit at TP), `--max-k-per-branch` (default 2; a
   specialist's branch only, the integration branch's K is bounded by `--max-parallel-tests`),
-  `--dev-leases`, `--judge-interval-sec` (default 600, must be positive), `--measurement local|hosted`,
-  `--[no-]make-before-break` (hosted only, default on: where the grant fits at least three tests at TP, a finished
-  test's sandbox is kept until the next test's runs, so that the cluster does not give its node to another job, and one
-  test fewer runs at once; off runs every test the grant fits).
+  `--dev-leases`, `--judge-interval-sec` (default 600, must be positive), `--measurement local|hosted`.
+- **Concurrency sweep:** `--[no-]enable-conc-sweep` (on by default), `--conc-sweep-concs C1,C2,...` and
+  `--conc-sweep-parallel N` (see [Concurrency sweep after CLOSE](#concurrency-sweep-after-close)).
 - **Directions:** `--specialist-prompt FILE` and `--reference NAME=DIR`, each repeatable.
 - **Third-party agents:** `--autonomous-agent SOURCE` (repeatable; a URL carrying credentials is refused),
   `--agent-directions`, `--agent-dossier-minutes`, `--agent-share-minutes`, `--agent-pack`, `--agent-launch`,
@@ -129,6 +217,12 @@ the profile and the root commit are the ones the first PRELUDE recorded.
 - **What it continues:** the earlier run's unfinished tests are withdrawn and the branches it left open are stopped.
   The roster and the integration branch open again (a `reopen` lineage event), and EXPLORE opens new branches, new
   ids and worktrees, on the integration head. Specialist and agent branches alike start fresh.
+- **Claw session:** a session started with `CLAW_SESSION_ID` records it as the top-level `claw_session_id` of
+  `MB-manifest.json` (`null` without it), so a collector of running sessions can tell whose a directory is before
+  CLOSE writes `session_breakdown.json`. The id follows the leg that runs: a `run --resume` or a `final-only` given
+  `CLAW_SESSION_ID` writes that id to the manifest and the breakdown, as the LLM attribution header carries it, and
+  logs the old and the new id when it changes; a leg given none keeps the recorded id. The manifest is the one record
+  of the id: the toolbox's `state.json` and `retest_view.json` do not carry it.
 - **Deadline:** the session's deadline moves by its downtime, the time between the last decision the earlier run
   recorded and the resume. The new deadline is written to the manifest and recorded as a `resume` phase in
   `MB-decisions.jsonl` with `ended`, `downtime_seconds` and `deadline`. GPU hours are not given back: the session
@@ -155,6 +249,43 @@ the profile and the root commit are the ones the first PRELUDE recorded.
   any other `run` option is given beside `--resume`.
 
 A session that cannot be resumed but stopped before FINAL can still be finished with `final-only SESSION_DIR`.
+
+## Concurrency sweep after CLOSE
+
+`run` (on by default; `--no-enable-conc-sweep`, hosted `multibranch.conc_sweep: false`, turns it off) sweeps the closed session's root and the commit
+FINAL chose once CLOSE has run, apart from `--max-hours` and `--max-gpu-hours`; `conc-sweep SESSION_DIR` runs the same
+sweep by hand, measured on this machine, and takes `--conc-sweep-concs` and `--conc-sweep-parallel` in place of the
+session's own. It runs only when FINAL chose a commit other than the root whose reproduction gained over the baseline.
+The points are `--conc-sweep-concs C1,C2,...` when given (hosted: `multibranch.conc_sweep_concs`), else every
+concurrency the InferenceX recipe of the frozen base publishes for the workload, with `--conc` among them; a
+`--reference-script` base needs them given. Each point is seeded with the recipe's own launch at its concurrency
+(the nearest higher one the recipe publishes, else its highest), under what the commit changes of the session's
+launch, its request cap
+included even below its concurrency, as InferenceX measures it. The tests run a concurrency's baseline and commit point together, `--conc-sweep-parallel N` of them at
+once (hosted: `multibranch.conc_sweep_parallel`; 2 by default, 1 for one at a time), within `--max-parallel-tests`.
+An AgentX point is a test of its own; an InferenceX arm is one sweep test over the points that launch alike, whose
+timeout scales with them. The tests are session measurements of the commits as they are: no accuracy and no checks.
+
+The sweep logs its estimated length (each point priced as the session's longest root test) and, hosted, how long it
+has: a point that would end past the grant's tests' end is not started and reads `skipped_budget`. It writes
+`MB-reports/conc_sweep_summary.json`, `conc_sweep_raw.csv` and `conc_sweep_curve.png`, the summary after every test,
+with `status` `succeeded`, `partial`, `failed`, `skipped` or `cancelled` (a stop signal; the measured points stay), and
+carries the summary each time as `conc_sweep_summary` in `MB-reports/session_breakdown.json`; its header adds the image the tests ran (`run_image`) beside the base's. A base frozen before it recorded its per-concurrency
+launches is skipped (`no_source_launches`) until they are backfilled (see the single-lineage
+[optimize guide](optimize.md#sweep-concurrency-after-the-session)). A
+later run measures only the points not yet measured, and a hosted restart of a session that closed before its sweep
+finished sweeps it again before it writes `exit.json`.
+
+A hosted run sweeps a closed session with a campaign spec of `flow: "conc_sweep"`: `conc_sweep.session_dir` names the
+session (an absolute path that resolves below the run's `USER_DATA_PATH`, read and written as the directory it resolves
+to; the report is written back into it), `conc_sweep.concs` its points in place of the recipe's and
+`conc_sweep.parallel` its tests at once. `hardware.tp`, `hardware.gpu_type` and `framework.name` must be the
+session's; `placement.measurement` says where the tests run, as for flow `multibranch`. The run optimizes nothing and
+ends `final: true` however the sweep ends, with `stop_reason` `conc_sweep_<status>` (`conc_sweep_skipped:<reason>` for
+a skipped sweep); a frozen base that no longer loads ends it `final: true` too. To finish a `partial` or `cancelled`
+sweep, start another such run on the same session, which measures only the points not yet measured; a restart of the
+same run takes over the lock its earlier start left in the session. The runner source is cloned per commit
+(`MB-runner-source/<sha>`), so a run of newer code than the session's measures with its own.
 
 ## Exit codes
 

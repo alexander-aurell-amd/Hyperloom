@@ -40,11 +40,6 @@ _ALLOWED: tuple[tuple[str, str, str], ...] = (
         "This file names the old spellings in order to forbid them.",
     ),
     (
-        "src/kernelforge/tests/agent_backends/test_agent_env_contract.py",
-        r"KERNEL_AGENTS_MODEL",
-        "The test that asserts the alias is no longer read has to name it.",
-    ),
-    (
         "docs/release-notes.md",
         r"kernel-agents",
         "Release notes naming the retired console script, so an operator whose script "
@@ -107,6 +102,12 @@ _LLM_ALLOWED: tuple[tuple[str, str, str], ...] = (
         "src/kernelforge/tests/test_rename_completeness.py",
         r".",
         "This file names the old spelling in order to forbid it.",
+    ),
+    (
+        "docs/release-notes.md",
+        r"`kernelforge\.llm`",
+        "Release notes naming the dissolved package, so code that still imports from it "
+        "recognises the path that now fails.",
     ),
 )
 

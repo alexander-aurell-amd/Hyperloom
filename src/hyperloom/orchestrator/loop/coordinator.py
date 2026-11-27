@@ -37,7 +37,6 @@ _BACKEND_UNHEALTHY_STOP_SEC: float = 3600.0
 # How many turns in a row one agent may answer without an intent before the session stops.
 _NO_INTENT_STOP_TURNS: int = 50
 from ..phases import machine_state as _phase_state
-from hyperloom.inference_optimizer.session.paths import stop_request_path
 from hyperloom.inference_optimizer.session.session_binding import bind_session
 from ..roles.agent_role import AgentRole, default_role_registry
 from ..roles.base import Backend, BackendError, BackendTurnResult, LLMCallFailed
@@ -106,7 +105,7 @@ def reap_orphaned_servers_best_effort(session_dir: Path, *, phase: str) -> None:
 
         if is_multi_node():
             return
-        from ..actions.executors._server_lifecycle import reap_orphaned_servers
+        from ..actions.executors.serving._server_lifecycle import reap_orphaned_servers
 
         reaped = reap_orphaned_servers(session_dir)
         if reaped:
@@ -139,11 +138,9 @@ class AdvisoryServices:
 
     Attributes:
         knowledge_plane: KnowledgePlane facade; pre-warms PR feed + advisory context.
-        proposal_scorer: Advisory multi-model specialist-proposal scorer.
     """
 
     knowledge_plane: Any = None
-    proposal_scorer: Any = None
 
 
 @dataclass(frozen=True)
@@ -187,8 +184,6 @@ class Coordinator:
         self.orch_prompt = OrchestrationPrompt(overrides={})
         # KnowledgePlane facade; pre-warms PR feed + advisory context.
         self.knowledge_plane: Any = advisory.knowledge_plane
-        # Advisory multi-model specialist-proposal scorer.
-        self.proposal_scorer: Any = advisory.proposal_scorer
         self._model_class_override: str = (settings.model_class or "").strip()
 
         # Validate every reactor has a backend wired.
@@ -218,8 +213,8 @@ class Coordinator:
         self.conversation.attach_orchestration_context_tools()
         # Resume detection must run before any boot-time state.json write.
         self.writeback.detect_resume_state()
-        # Reap serving processes orphaned by a prior monitor-process crash (e.g. a raylet death that took the
-        # optimizer down mid-benchmark), scoped strictly to this session's own pidfiles.
+        # Reap serving processes orphaned by a prior monitor-process crash, scoped strictly to this session's own
+        # pidfiles.
         reap_orphaned_servers_best_effort(self.session_dir, phase="boot")
         # Before any bring-up can dispatch: an attempt classified against a
         # different pin is not comparable with its neighbours.
@@ -378,10 +373,10 @@ class Coordinator:
         return self._collaborator("_phase_prelude", PreludePhase)
 
     @property
-    def phase_sweep(self):
-        from ..phases.sweep import SweepPhase
+    def phase_cycle_end(self):
+        from ..phases.cycle_end import CycleEndPhase
 
-        return self._collaborator("_phase_sweep", SweepPhase)
+        return self._collaborator("_phase_cycle_end", CycleEndPhase)
 
     @property
     def phase_close(self):
@@ -743,13 +738,13 @@ class Coordinator:
     def stop_requested(self) -> bool:
         """Whether an operator has asked this run to stop.
 
-        Reads the asyncio event, the drain's threading event and the stop-request file, so the end-of-tick check
-        sees a signal that arrived during that tick and a request that came while no drain was armed.
+        Reads the asyncio event and the drain's threading event, so the end-of-tick check sees a signal that arrived
+        during that tick.
 
         Returns:
             bool: True once a stop has been asked for by either route.
         """
-        if self._stop.is_set() or stop_request_path(self.session_dir).is_file():
+        if self._stop.is_set():
             return True
         drain = self._signals
         return drain is not None and drain.requested.is_set()
@@ -806,7 +801,7 @@ class Coordinator:
 
     # Long-run interface
     async def run(self, *, objective: Objective | None = None, options: RunOptions = RunOptions()) -> str:
-        """Run reactor + dispatcher until a stop condition fires (priority order): signal, a stop_reason the phase machine recorded (a met target closes through SWEEP as one), time_exhausted (via closing phase), emergency, max_ticks. Sets + saves + returns shared_state.stop_reason.
+        """Run reactor + dispatcher until a stop condition fires (priority order): signal, a stop_reason the phase machine recorded (a met target closes through CYCLE_END as one), time_exhausted (via closing phase), emergency, max_ticks. Sets + saves + returns shared_state.stop_reason.
 
         The whole run is one ``session`` trajectory span, and every trajectory event recorded beneath it inherits this
         session dir and the live phase / tick.

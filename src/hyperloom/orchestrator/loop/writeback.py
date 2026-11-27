@@ -6,7 +6,7 @@
 from __future__ import annotations
 import logging as _logging
 import time
-from ..actions.executors._agentx_prefix_cache import PREFIX_CACHE_OFF_ERROR_CLASS
+from ..actions.executors.workload._agentx_prefix_cache import PREFIX_CACHE_OFF_ERROR_CLASS
 from ..actions.executors.benchmark_result import is_valid_measurement
 from ..phases.machine_state import LifecycleMark, record_lifecycle_event
 from ..state._shared_state.attempt_audit import _AUDIT_ACTIONS
@@ -200,9 +200,6 @@ class WritebackCollaborator(
             return _PromoteOutcome(verdict=Verdict.RECORDED)
         outcome = _PromoteOutcome(verdict=Verdict.RECORDED)
         await getattr(self, handler_name)(result, task, outcome)
-        # sweep / conc_sweep already recorded + saved + returned via their handler.
-        if outcome.early_return:
-            return outcome
         # Audit trail: one succeeded-attempt record with branch-supplied decision/extras.
         if outcome.audit_decision is not None and task_kind in _AUDIT_ACTIONS:
             self.shared_state.record_action_attempt(
@@ -228,5 +225,4 @@ class WritebackCollaborator(
         "roofline": "_promote_roofline",
         "explore": "_promote_explore",
         "integrate_patch": "_promote_integrate_patch",
-        "conc_sweep": "_promote_conc_sweep",
     }

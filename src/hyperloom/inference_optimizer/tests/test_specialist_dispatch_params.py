@@ -96,7 +96,7 @@ def test_bench_falsy_values(falsy):
 
 
 def test_reserves_benchmark_lane_only_for_bench_capable():
-    """Only bench-capable patch specialists hold the whole-machine serving_slot."""
+    """Only bench-capable patch specialists reserve the benchmark lane."""
     assert resolve_specialist_profile({"mode": "patch", "bench": True}).reserves_benchmark_lane is True
     authoring = {"framework_agent_authoring": True, "domain": "serving_specialist"}
     assert resolve_specialist_profile(authoring).reserves_benchmark_lane is False
@@ -170,11 +170,6 @@ def test_wall_budget_base_min_by_mode():
 # --------------------------------------------------------------------------- # Freeform sanity gate (PolicyGate)
 # --------------------------------------------------------------------------- #
 @pytest.fixture
-def orchestration_role():
-    return default_role_registry()["orchestration"]
-
-
-@pytest.fixture
 def gate():
     return PolicyGate(role_registry=default_role_registry())
 
@@ -183,16 +178,14 @@ def _dispatch(params: dict) -> dict:
     return {"action_name": "specialist", "params": params}
 
 
-def test_freeform_single_task_ok(gate, orchestration_role):
+def test_freeform_single_task_ok(gate):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch({"scope": "freeform", "task_description": "Profile the decode path and report top stalls."}),
     )
 
 
-def test_freeform_wave_ok(gate, orchestration_role):
+def test_freeform_wave_ok(gate):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "freeform",
@@ -205,10 +198,9 @@ def test_freeform_wave_ok(gate, orchestration_role):
     )
 
 
-def test_freeform_skips_tag_and_gap_requirements(gate, orchestration_role):
+def test_freeform_skips_tag_and_gap_requirements(gate):
     """Freeform carries no domain/tag/gap anchor — the tag/gap checks that a single-domain dispatch would trip must NOT fire here."""
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch({"scope": "freeform", "task_description": "A short mandate."}),
     )
 
@@ -218,36 +210,33 @@ def test_freeform_skips_tag_and_gap_requirements(gate, orchestration_role):
     [{"scope": "freeform", "task_description": "   "}, {"scope": "freeform"}],
     ids=["blank", "absent"],
 )
-def test_freeform_empty_description_rejected(gate, orchestration_role, params):
+def test_freeform_empty_description_rejected(gate, params):
     with pytest.raises(PolicyDenied) as exc:
-        gate._validate_specialist_dispatch(orchestration_role, _dispatch(params))
+        gate._validate_specialist_dispatch(_dispatch(params))
     assert exc.value.rule == "specialist_freeform_empty_description"
 
 
-def test_freeform_description_too_long_rejected(gate, orchestration_role):
+def test_freeform_description_too_long_rejected(gate):
     huge = "x" * (SPECIALIST_FREEFORM_TASK_DESC_MAX_CHARS + 1)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "task_description": huge}),
         )
     assert exc.value.rule == "specialist_freeform_description_too_long"
 
 
 @pytest.mark.parametrize("framework", ["tensorrt", "", None])
-def test_unregistered_framework_param_rejected(gate, orchestration_role, framework):
+def test_unregistered_framework_param_rejected(gate, framework):
     """A specialist resolves its source tree from params.framework, so the name must be one the registry knows."""
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "task_description": "A short mandate.", "framework": framework}),
         )
     assert exc.value.rule == "specialist_framework_unregistered"
 
 
-def test_registered_framework_param_admitted(gate, orchestration_role):
+def test_registered_framework_param_admitted(gate):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch({"scope": "freeform", "task_description": "A short mandate.", "framework": "vllm"}),
     )
 
@@ -260,54 +249,48 @@ def test_registered_framework_param_admitted(gate, orchestration_role):
         "please shutdown the host afterwards",
     ],
 )
-def test_freeform_destructive_text_allowed(gate, orchestration_role, desc):
+def test_freeform_destructive_text_allowed(gate, desc):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch({"scope": "freeform", "task_description": desc}),
     )
 
 
-def test_freeform_empty_wave_falls_through_to_single_task(gate, orchestration_role):
+def test_freeform_empty_wave_falls_through_to_single_task(gate):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch({"scope": "freeform", "tasks": [], "task_description": "probe"}),
     )
 
 
-def test_freeform_wave_too_large_rejected(gate, orchestration_role):
+def test_freeform_wave_too_large_rejected(gate):
     tasks = [{"task_description": f"task {i}"} for i in range(SPECIALIST_FREEFORM_WAVE_MAX + 1)]
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "tasks": tasks}),
         )
     assert exc.value.rule == "specialist_freeform_wave_too_large"
 
 
-def test_freeform_wave_non_dict_task_rejected(gate, orchestration_role):
+def test_freeform_wave_non_dict_task_rejected(gate):
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "tasks": ["not a dict"]}),
         )
     assert exc.value.rule == "specialist_freeform_wave_invalid_task"
     assert "tasks[0]" in str(exc.value)
 
 
-def test_freeform_wave_empty_task_description_rejected(gate, orchestration_role):
+def test_freeform_wave_empty_task_description_rejected(gate):
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "tasks": [{"task_description": ""}]}),
         )
     assert exc.value.rule == "specialist_freeform_empty_description"
     assert "tasks[0]" in str(exc.value)
 
 
-def test_freeform_wave_all_invalid_rejected(gate, orchestration_role):
+def test_freeform_wave_all_invalid_rejected(gate):
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "tasks": ["bad", {"task_description": ""}]}),
         )
     assert exc.value.rule == "specialist_freeform_wave_invalid_task"
@@ -319,9 +302,8 @@ _REAL_TAGS = sorted(KNOWLEDGE_DOMAIN_TAG_SET)
 
 
 @pytest.mark.skipif(len(_REAL_TAGS) < 1, reason="no knowledge-domain tags")
-def test_domains_scope_with_one_tag_allowed(gate, orchestration_role):
+def test_domains_scope_with_one_tag_allowed(gate):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "domains",
@@ -332,70 +314,9 @@ def test_domains_scope_with_one_tag_allowed(gate, orchestration_role):
     )
 
 
-# --------------------------------------------------------------------------- # Gap auto-fill from the gaps[] ledger
-# (friction symmetry, point 4) --------------------------------------------------------------------------- #
-def _gate_with_gaps(gaps: list[dict]) -> PolicyGate:
-    from hyperloom.orchestrator.state.shared_state import SharedState
-
-    state = SharedState()
-    for g in gaps:
-        state.upsert_gap(g)
-    return PolicyGate(role_registry=default_role_registry(), shared_state=state)
-
-
-def test_domain_dispatch_backfills_gap_from_ledger(orchestration_role):
-    gate = _gate_with_gaps(
-        [
-            {
-                "canonical_id": "gap.framework.scheduler.session-1",
-                "domain_hint": "serving_specialist",
-                "severity": "high",
-            },
-        ]
-    )
-    params = {"domain": "serving_specialist"}  # no gap_canonical_id
-    gate._validate_specialist_dispatch(orchestration_role, _dispatch(params))
-    # Mutated in place so the downstream dispatch carries the canonical id.
-    assert params["gap_canonical_id"] == "gap.framework.scheduler.session-1"
-
-
-def test_gap_backfill_prefers_high_severity_then_least_attempted(orchestration_role):
-    gate = _gate_with_gaps(
-        [
-            {
-                "canonical_id": "gap.low",
-                "domain_hint": "serving_specialist",
-                "severity": "medium",
-                "attempts": [{"x": 1}],
-            },
-            {"canonical_id": "gap.win", "domain_hint": "framework", "severity": "high"},
-        ]
-    )
-    params = {"domain": "serving_specialist"}
-    gate._validate_specialist_dispatch(orchestration_role, _dispatch(params))
-    # framework is serving_specialist's kb_anchor, so both match; high wins.
-    assert params["gap_canonical_id"] == "gap.win"
-
-
-def test_gap_backfill_noop_when_no_anchor_match_still_rejects(orchestration_role):
-    gate = _gate_with_gaps(
-        [
-            {"canonical_id": "gap.kernel", "domain_hint": "kernel_switch_specialist", "severity": "high"},
-        ]
-    )
-    with pytest.raises(PolicyDenied) as exc:
-        gate._validate_specialist_dispatch(
-            orchestration_role,
-            _dispatch({"domain": "comm_specialist"}),
-        )
-    assert exc.value.rule == "specialist_dispatch_source"
-    assert "gap" in str(exc.value)
-
-
 @pytest.mark.skipif(len(_REAL_TAGS) < 2, reason="need >=2 knowledge-domain tags")
-def test_single_domain_scope_with_multiple_tags_allowed(gate, orchestration_role):
+def test_single_domain_scope_with_multiple_tags_allowed(gate):
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "domain",
@@ -426,12 +347,11 @@ def _gate_with_gpu_capacity(capacity: int, *, tp: int = 0) -> PolicyGate:
     )
 
 
-def test_freeform_gpu_request_clears_ceiling(orchestration_role, monkeypatch):
+def test_freeform_gpu_request_clears_ceiling(monkeypatch):
     for name in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "TP"):
         monkeypatch.delenv(name, raising=False)
     gate = _gate_with_gpu_capacity(2)
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "freeform",
@@ -443,11 +363,10 @@ def test_freeform_gpu_request_clears_ceiling(orchestration_role, monkeypatch):
     )
 
 
-def test_freeform_gpu_request_rejected_when_pool_disabled(orchestration_role):
+def test_freeform_gpu_request_rejected_when_pool_disabled():
     gate = _gate_with_gpu_capacity(0)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -459,11 +378,10 @@ def test_freeform_gpu_request_rejected_when_pool_disabled(orchestration_role):
     assert exc.value.rule == "specialist_gpu_pool_disabled"
 
 
-def test_freeform_gpu_request_exceeds_capacity_rejected(orchestration_role):
+def test_freeform_gpu_request_exceeds_capacity_rejected():
     gate = _gate_with_gpu_capacity(1)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -476,11 +394,10 @@ def test_freeform_gpu_request_exceeds_capacity_rejected(orchestration_role):
     assert exc.value.rule == "specialist_gpu_request_exceeds_capacity"
 
 
-def test_freeform_gpu_request_nonpositive_count_rejected(orchestration_role):
+def test_freeform_gpu_request_nonpositive_count_rejected():
     gate = _gate_with_gpu_capacity(2)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -505,12 +422,11 @@ def test_gate_judges_an_enablement_gpu_request_by_the_dispatcher_rule(whole_mach
     gate._validate_specialist_gpu_request(bad_count)
 
 
-def test_domain_gpu_request_still_governed_after_refactor(orchestration_role):
+def test_domain_gpu_request_still_governed_after_refactor():
     """Regression: the GPU check extracted into _validate_specialist_gpu_request must still fire on the domain-anchored path."""
     gate = _gate_with_gpu_capacity(0)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "domain": "serving_specialist",
@@ -522,7 +438,7 @@ def test_domain_gpu_request_still_governed_after_refactor(orchestration_role):
     assert exc.value.rule == "specialist_gpu_pool_disabled"
 
 
-def test_bench_specialist_without_explicit_needs_gpu_is_gated(orchestration_role, monkeypatch):
+def test_bench_specialist_without_explicit_needs_gpu_is_gated(monkeypatch):
     """A bench-enabled (mode=patch & bench=true) specialist auto-defaults needs_gpu=True at dispatch; the gate must mirror that so it is rejected when the pool is disabled."""
     for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "TP", "INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES"):
         monkeypatch.delenv(name, raising=False)
@@ -530,7 +446,6 @@ def test_bench_specialist_without_explicit_needs_gpu_is_gated(orchestration_role
     gate = _gate_with_gpu_capacity(0)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -544,7 +459,7 @@ def test_bench_specialist_without_explicit_needs_gpu_is_gated(orchestration_role
     assert exc.value.rule == "specialist_gpu_pool_disabled"
 
 
-def test_bench_specialist_whole_machine_lane_allows_full_node(orchestration_role, monkeypatch):
+def test_bench_specialist_whole_machine_lane_allows_full_node(monkeypatch):
     """A bench specialist takes the whole-machine, time-shared GPU lane, so serving occupying the whole node (TP == #GPUs) does not deny it — the serving-disjoint carve does not apply to the whole-machine pool."""
     for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "TP", "INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES"):
         monkeypatch.delenv(name, raising=False)
@@ -552,7 +467,6 @@ def test_bench_specialist_whole_machine_lane_allows_full_node(orchestration_role
     gate = _gate_with_gpu_capacity(4, tp=4)
     # gpu_count floored to serving TP=4; whole-machine pool has all 4 cards.
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "freeform",
@@ -565,7 +479,7 @@ def test_bench_specialist_whole_machine_lane_allows_full_node(orchestration_role
     )
 
 
-def test_bench_specialist_denied_when_whole_machine_too_small(orchestration_role, monkeypatch):
+def test_bench_specialist_denied_when_whole_machine_too_small(monkeypatch):
     """A bench specialist is still denied when the whole node physically has fewer cards than the serving TP it must shard a server across."""
     for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "TP", "INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES"):
         monkeypatch.delenv(name, raising=False)
@@ -573,7 +487,6 @@ def test_bench_specialist_denied_when_whole_machine_too_small(orchestration_role
     gate = _gate_with_gpu_capacity(4, tp=4)
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -588,14 +501,13 @@ def test_bench_specialist_denied_when_whole_machine_too_small(orchestration_role
     assert "whole-machine GPU pool size=2" in str(exc.value)
 
 
-def test_bench_specialist_omitted_gpu_count_allows_whole_machine(orchestration_role, monkeypatch):
+def test_bench_specialist_omitted_gpu_count_allows_whole_machine(monkeypatch):
     """Omitting gpu_count defaults a bench specialist to serving TP and is valid when the whole-machine pool has at least that many cards."""
     for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "TP", "INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "0,1,2,3,4,5,6,7")
     gate = _gate_with_gpu_capacity(8, tp=4)
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "freeform",
@@ -607,11 +519,10 @@ def test_bench_specialist_omitted_gpu_count_allows_whole_machine(orchestration_r
     )
 
 
-def test_research_specialist_without_needs_gpu_is_not_gated(orchestration_role):
+def test_research_specialist_without_needs_gpu_is_not_gated():
     """A non-bench (research) specialist needs no GPU, so the pool-disabled gate must NOT fire for it even when capacity is 0."""
     gate = _gate_with_gpu_capacity(0)
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "freeform",
@@ -622,10 +533,9 @@ def test_research_specialist_without_needs_gpu_is_not_gated(orchestration_role):
     )
 
 
-def test_freeform_wave_mixed_valid_and_invalid_rejected(gate, orchestration_role):
+def test_freeform_wave_mixed_valid_and_invalid_rejected(gate):
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -640,19 +550,17 @@ def test_freeform_wave_mixed_valid_and_invalid_rejected(gate, orchestration_role
     assert "tasks[1]" in str(exc.value)
 
 
-def test_freeform_negative_max_turns_rejected(gate, orchestration_role):
+def test_freeform_negative_max_turns_rejected(gate):
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch({"scope": "freeform", "task_description": "probe", "max_turns": -1}),
         )
     assert "max_turns" in str(exc.value)
 
 
-def test_freeform_wave_task_negative_max_turns_rejected(gate, orchestration_role):
+def test_freeform_wave_task_negative_max_turns_rejected(gate):
     with pytest.raises(PolicyDenied) as exc:
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -663,12 +571,11 @@ def test_freeform_wave_task_negative_max_turns_rejected(gate, orchestration_role
     assert "tasks[0].max_turns" in str(exc.value)
 
 
-def test_freeform_max_turns_above_cap_rejected(gate, orchestration_role):
+def test_freeform_max_turns_above_cap_rejected(gate):
     from hyperloom.orchestrator.specialists.domains import SPECIALIST_MAX_TURNS_HARD_CAP
 
     with pytest.raises(PolicyDenied):
         gate._validate_specialist_dispatch(
-            orchestration_role,
             _dispatch(
                 {
                     "scope": "freeform",
@@ -677,17 +584,6 @@ def test_freeform_max_turns_above_cap_rejected(gate, orchestration_role):
                 }
             ),
         )
-
-
-async def test_a_padded_proposal_name_keeps_its_score_under_that_name():
-    """The score table looks a variant up by its proposal_set name, so the scorer must not strip it."""
-    from hyperloom.inference_optimizer.tests.test_proposal_scorer_coverage_unit import _FakeClient
-    from hyperloom.orchestrator.scoring.proposal_scorer import ProposalScorer
-
-    client = _FakeClient({"m": '{"scores": {"proposal_0": {"score": 5, "reason": "ok"}}}'})
-    scorer = ProposalScorer(models=("m",), client_factory=lambda: client)
-    out = await scorer.score(gap={"domain": "d"}, proposals=[{"name": " x "}])
-    assert list(out["models"]["m"]) == [" x "]
 
 
 def test_resolve_specialist_max_turns_zero_uses_default():
@@ -702,7 +598,7 @@ def test_resolve_specialist_max_turns_zero_uses_default():
 # --------------------------------------------------------------------------- # Tool surface: TaskKill and
 # SlashCommand are denied. --------------------------------------------------------------------------- #
 def test_specialists_are_denied_only_the_process_cleanup_tools():
-    """specialist.md's containment model: every tool except these two, so patch authoring and KB writes stay open."""
+    """A specialist gets every tool except these two, so patch authoring and KB writes stay open."""
     from hyperloom.orchestrator.specialists.runner import SPECIALIST_TOOL_DENYLIST
 
     assert SPECIALIST_TOOL_DENYLIST == frozenset({"KillShell", "SlashCommand"})
@@ -742,10 +638,9 @@ def test_normalize_dispatch_tags_domain_alias_translated():
     assert normalize_dispatch_tags({"domain": "system_specialist"}) == ["systems"]
 
 
-def test_dispatch_with_domain_key_tag_no_longer_rejected(gate, orchestration_role):
+def test_dispatch_with_domain_key_tag_no_longer_rejected(gate):
     """tags=['serving_specialist'] (a KEY) must validate cleanly (key->framework)."""
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "domain",
@@ -756,10 +651,9 @@ def test_dispatch_with_domain_key_tag_no_longer_rejected(gate, orchestration_rol
     )
 
 
-def test_dispatch_with_garbage_tag_allowed(gate, orchestration_role):
+def test_dispatch_with_garbage_tag_allowed(gate):
     """An out-of-vocabulary tag is observed, not denied; the runner synthesizes an empty result."""
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "domain",
@@ -804,7 +698,7 @@ def test_gate_denies_orchestration_naming_a_coordinator_dispatched_domain(gate):
 
 # --------------------------------------------------------------------------- # gate gpu_count default aligned with
 # dispatcher at serving_tp=0 --------------------------------------------------------------------------- #
-def test_bench_specialist_no_serving_tp_defaults_to_whole_machine(orchestration_role, monkeypatch):
+def test_bench_specialist_no_serving_tp_defaults_to_whole_machine(monkeypatch):
     """When serving_tp=0, a bench specialist with no explicit gpu_count must default to the whole-machine pool size in the gate, matching the dispatcher's fallback to ``gpu_pool.capacity``."""
     for name in ("HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES", "TP", "INFERENCE_OPTIMIZER_GPU_SPECIALIST_DEVICES"):
         monkeypatch.delenv(name, raising=False)
@@ -813,7 +707,6 @@ def test_bench_specialist_no_serving_tp_defaults_to_whole_machine(orchestration_
     gate = _gate_with_gpu_capacity(4, tp=0)
     # gate's default gpu_count must be 4 (whole-machine), agreeing with the dispatcher that leases all 4 cards.
     gate._validate_specialist_dispatch(
-        orchestration_role,
         _dispatch(
             {
                 "scope": "freeform",
@@ -859,3 +752,38 @@ def test_patch_capable_domains_default_to_patch():
         assert domain.default_mode == "patch"
         profile = resolve_specialist_profile({"domain": key}, domain=domain)
         assert profile.mode == MODE_PATCH
+
+
+# --------------------------------------------------------------------------- # --no-source-changes: a patch it would
+# skip is never written --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "params",
+    [
+        pytest.param({"domain": "compiler_specialist"}, id="anchored_default"),
+        pytest.param({"domain": "serving_specialist", "mode": "patch"}, id="explicit_patch"),
+    ],
+)
+def test_a_patch_dispatch_without_bench_runs_as_research_under_no_source_changes(params):
+    prof = resolve_specialist_profile({**params, "no_source_changes": True})
+    assert prof.mode == MODE_RESEARCH
+    assert prof.bench is False
+    assert wall_budget_base_min({**params, "no_source_changes": True}) == 10.0
+
+
+def test_a_benching_patch_dispatch_keeps_patch_mode_under_no_source_changes():
+    """Its GPU measure-edit-measure loop is how it finds configuration."""
+    prof = resolve_specialist_profile({"domain": "serving_specialist", "bench": True, "no_source_changes": True})
+    assert (prof.mode, prof.bench) == (MODE_PATCH, True)
+
+
+@pytest.mark.parametrize(
+    "authoring",
+    [pytest.param({"enablement": True}, id="enablement"), pytest.param({"framework_agent_authoring": True}, id="fw")],
+)
+def test_an_authoring_round_keeps_patch_mode_under_no_source_changes(authoring):
+    prof = resolve_specialist_profile({"domain": "serving_specialist", "no_source_changes": True, **authoring})
+    assert prof.mode == MODE_PATCH
+
+
+def test_without_no_source_changes_an_anchored_dispatch_still_patches():
+    assert resolve_specialist_profile({"domain": "compiler_specialist", "no_source_changes": False}).mode == MODE_PATCH

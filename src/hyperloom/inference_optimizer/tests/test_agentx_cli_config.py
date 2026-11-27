@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from hyperloom_common import gpu_card
 from hyperloom.common.benchmark_config import BENCHMARK_CONFIG_ENV, benchmark_config_path
 from hyperloom.common.perf_metric import agentx_enabled
 from hyperloom.inference_optimizer import cli
@@ -19,12 +20,13 @@ from hyperloom.inference_optimizer.cli.benchmark_config import (
     write_agentx_benchmark,
 )
 from hyperloom.inference_optimizer.cli.parser import _build_parser
-from hyperloom.orchestrator.actions.executors._workload_envs import (
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import (
     default_baseline_config,
     materialize_benchmark_config,
     LaunchLayer,
 )
 from hyperloom.orchestrator.actions.executors.agentx_point import enable_profile
+from hyperloom.orchestrator.tests._fixtures import MI355X_CARD
 
 
 def load_benchmark(path: Path) -> dict:
@@ -106,7 +108,7 @@ def test_standard_cli_generates_native_yaml_and_candidate_controls(tmp_path, mon
     assert bench["agentx"]["mode"] == "canonical"
     assert bench["profiler"]["torch_profiler"] == {"enabled": False}
     assert "benchmark_script" not in bench
-    assert args.enable_conc_sweep is False
+    assert args.enable_conc_sweep is True
     assert agentx_enabled()
     assert default_baseline_config() == source
     candidate = materialize_benchmark_config(
@@ -218,7 +220,6 @@ def test_native_resume_does_not_regenerate_missing_snapshot(tmp_path):
         ["--nodes", "2"],
         ["--isl", "1024"],
         ["--osl", "512"],
-        ["--enable-conc-sweep"],
         ["--quantize", "fp8"],
         ["--extra-env", "AIPERF_BIN=/tmp/client"],
         ["--extra-env", "CONC=0", "--extra-env", "ISL=2048"],
@@ -281,10 +282,9 @@ def test_generated_snapshot_records_the_base_topology_and_precedes_manifest(tmp_
         "_enforce_expected_framework",
         "_apply_operator_supplied_paths",
         "_require_custom_entrypoint",
-        "_check_gfx_arch_resolvable",
     ):
         monkeypatch.setattr(cli, name, lambda *a, **kw: None)
-    monkeypatch.setattr(cli, "_autodetect_gpu_type", lambda: "mi355x")
+    monkeypatch.setattr(gpu_card, "read_cards", lambda: [MI355X_CARD])
     monkeypatch.setattr(cli, "resolve_framework_version", lambda args: "test-version")
     monkeypatch.setattr(cli, "make_session_dir", lambda **kw: tmp_path)
     monkeypatch.setattr(cli, "_acquire_session_lock_or_exit", lambda path: None)

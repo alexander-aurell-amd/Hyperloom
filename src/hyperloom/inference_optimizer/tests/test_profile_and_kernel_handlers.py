@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import sys
 import asyncio
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -16,9 +17,9 @@ from unittest.mock import patch
 import pytest
 
 from hyperloom.inference_optimizer.cli import bootstrap as cli_bootstrap
-from hyperloom.inference_optimizer import gpu_types
 from hyperloom.inference_optimizer.cli import parser as cli_parser
 from hyperloom.orchestrator.kernel import kernel_decisions as kd
+from hyperloom.orchestrator.tests._fixtures import MI325X_CARD, publish_card
 from hyperloom.orchestrator.kernel import request_handlers as krh
 
 from .conftest import seed_integrate_verdict, seed_kernel_keep
@@ -29,7 +30,7 @@ from hyperloom.orchestrator.actions.executors.baseline import (
     BaselineExecutor,
     BenchmarkRunExecutor,
 )
-from hyperloom.orchestrator.actions.executors._workload_envs import (
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import (
     default_baseline_config,
     materialize_benchmark_config,
     BenchmarkTarget,
@@ -43,10 +44,7 @@ from hyperloom.orchestrator.actions.executors.profile import (
 )
 from hyperloom.orchestrator.trace_analysis._trace_rank import trace_rank as _trace_rank
 from inference_suite.contracts import RunLayout
-from hyperloom.orchestrator.roles import (
-    MockBackend,
-    ScriptedPlan,
-)
+from hyperloom.orchestrator.tests.mock_backend import MockBackend, ScriptedPlan
 from hyperloom.orchestrator.loop.coordinator import Coordinator
 from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
 from hyperloom.orchestrator.state.task_registry import TaskRegistry, TaskSpec
@@ -73,7 +71,14 @@ def session_dir(tmp_path, monkeypatch) -> Path:
     # A usable checkout needs .git (completeness gate).
     (tracelens_root / ".git").mkdir(parents=True)
     monkeypatch.setenv("TRACELENS_ROOT", str(tracelens_root))
-    return make_session_dir()
+    session = make_session_dir()
+    # A session whose card was read records its label; trace analysis names its platform by it.
+    from hyperloom.orchestrator.state.shared_state import SharedState
+
+    state = SharedState.load_or_init(session)
+    state.gpu_type = "mi355x"
+    state.save(session)
+    return session
 
 
 def _heartbeat() -> Intent:
@@ -92,7 +97,7 @@ def test_mi325x_session_records_the_real_gpu_type(tmp_path, monkeypatch):
         ["optimize", "--model", "/models/Qwen3", "--max-hours", "1", "--gpu-type", "mi325x"]
     )
 
-    assert gpu_types.reference_gpu_type_for_gfx("gfx1100") is None
+    publish_card(monkeypatch, MI325X_CARD)
     manifest = build_manifest(tmp_path, args=args, session_id="mi325x-session")
     state = cli_bootstrap._seed_shared_state(
         tmp_path,
@@ -103,6 +108,9 @@ def test_mi325x_session_records_the_real_gpu_type(tmp_path, monkeypatch):
     )
 
     assert manifest["gpu_type"] == "mi325x"
+    # The card the session started on is archived beside its label, and names the arch.
+    assert manifest["gpu_card"] == dataclasses.asdict(MI325X_CARD)
+    assert manifest["gfx_arch"] == "gfx942"
     assert state.gpu_type == "mi325x"
     assert os.environ["TARGET_GPU_TYPE"] == "mi325x"
 
@@ -124,6 +132,8 @@ def test_mi308x_session_records_the_real_gpu_type(tmp_path, monkeypatch):
     )
 
     assert manifest["gpu_type"] == "mi308x"
+    # A label given without a readable card: the name is kept, and no facts are invented for it.
+    assert (manifest["gpu_card"], manifest["gfx_arch"]) == (None, None)
     assert state.gpu_type == "mi308x"
     assert os.environ["TARGET_GPU_TYPE"] == "mi308x"
 

@@ -12,8 +12,10 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 
+from hyperloom.common.perf_metric import DATASET_PATH_ENV
 from hyperloom.common.url_userinfo import CREDENTIALED_URL_RE
 from hyperloom.common.workload_defaults import DEFAULT_EP
+from hyperloom.common.concurrencies import parse_concurrencies
 from hyperloom_multibranch.blackboard.knowledge.reference_leads import INFERENCEX_REFERENCE
 from hyperloom_multibranch.contracts.toolbox import WorkloadKind
 from hyperloom_multibranch.rulegate.agentx import AgentXObjective
@@ -25,7 +27,9 @@ from hyperloom_multibranch.scheduling.roster import RosterCaps
 from hyperloom_multibranch.scheduling.settings import (
     AGENT_PORT,
     DEFAULT_AGENTX_OBJECTIVE,
+    DEFAULT_CONC_SWEEP_PARALLEL,
     DOSSIER_MINUTES,
+    MAX_BOOT_BUDGET_SEC,
     SHARE_MINUTES,
     InferenceXShape,
     KernelOptimizer,
@@ -45,8 +49,6 @@ DEFAULT_MAX_K_PER_BRANCH = 2
 DEFAULT_JUDGE_INTERVAL_SECONDS = 600.0
 ENCODING = "utf-8"
 FILE_METAVAR = "FILE"
-#: The GPU types a session runs on; the toolbox's environment exports the board itself as ``GPU_TYPE``.
-SESSION_GPU_TYPES = ("mi300x", "mi325x", "mi350x", "mi355x")
 #: The options ``run`` requires unless it is given ``--resume``, by their argparse names.
 RUN_REQUIRED = ("model", "framework", "gpu_type", "workload", "tp", "conc", "precision")
 #: The options an inferencex workload requires and an agentx one refuses.
@@ -59,6 +61,8 @@ SWITCH = "store_true"
 LOCAL_MEASUREMENT, HOSTED_MEASUREMENT = "local", "hosted"
 #: The command that runs FINAL and CLOSE alone over a session directory.
 FINAL_ONLY_COMMAND = "final-only"
+#: The command that runs the concurrency sweep of a closed session.
+CONC_SWEEP_COMMAND = "conc-sweep"
 #: The command a host runs a session under, with the campaign spec it injects.
 HOSTED_COMMAND = "hosted"
 
@@ -72,13 +76,23 @@ def build_parser() -> argparse.ArgumentParser:
         FINAL_ONLY_COMMAND,
         help=(
             "Emergency recovery: run FINAL and CLOSE over a session directory that ended before FINAL, a session"
-            " killed with its machine included. It rewrites that session's report, dashboard and breakdown, and"
-            " exits as that session did, so a session that did not run its course still fails. Refused if the"
-            " session is still running, already chose in FINAL, or ran on another build than this one."
+            " killed with its machine included. It rewrites that session's report, dashboard, breakdown and"
+            " manifest, and exits as that session did, so a session that did not run its course still fails."
+            " Refused if the session is still running, already chose in FINAL, or ran on another build than this one."
         ),
     )
     final_only.add_argument("session_dir", type=Path, help="The session directory of the run to finish.")
-    final_only.add_argument("-v", "--verbose", action=SWITCH, help="Log at debug level.")
+    _add_verbose_option(final_only)
+    conc_sweep = commands.add_parser(
+        CONC_SWEEP_COMMAND,
+        help=(
+            "Sweep a closed session's root and the commit FINAL chose over the concurrencies of the base's InferenceX"
+            " recipe, measured on this machine; the points already measured are kept."
+        ),
+    )
+    conc_sweep.add_argument("session_dir", type=Path, help="The session directory of a closed run.")
+    _add_conc_sweep_options(conc_sweep, concs=None, parallel=None)
+    _add_verbose_option(conc_sweep)
     hosted = commands.add_parser(HOSTED_COMMAND, help="Run under a host that injects the campaign spec and its inputs.")
     hosted_commands = hosted.add_subparsers(dest="hosted_command", required=True)
     hosted_commands.add_parser(
@@ -96,7 +110,11 @@ def _add_run_options(run: argparse.ArgumentParser) -> None:
     _add_specialist_input_options(run)
     _add_concurrency_options(run)
     _add_playbook_option(run)
-    run.add_argument("-v", "--verbose", action=SWITCH, help="Log at debug level.")
+    _add_verbose_option(run)
+
+
+def _add_verbose_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("-v", "--verbose", action=SWITCH, help="Log at debug level.")
 
 
 def _add_agentx_options(run: argparse.ArgumentParser) -> None:
@@ -126,7 +144,7 @@ def _add_workload_options(run: argparse.ArgumentParser) -> None:
 
     run.add_argument("--model", help="Model path, or an id found under HL_MODEL_BASE or in the Hugging Face cache.")
     run.add_argument("--framework", help="Inference framework, e.g. vllm or sglang.")
-    run.add_argument("--gpu-type", type=str.lower, choices=SESSION_GPU_TYPES, help="GPU type, in any case.")
+    run.add_argument("--gpu-type", type=str.lower, help="The label results are filed under, e.g. mi355x, in any case.")
     run.add_argument("--workload", choices=[kind.value for kind in WorkloadKind], help="Workload kind.")
     run.add_argument("--tp", type=int, help="Tensor-parallel size; must fit the machine's cards.")
     run.add_argument(
@@ -137,6 +155,19 @@ def _add_workload_options(run: argparse.ArgumentParser) -> None:
         run.add_argument(f"--{name}", type=int, default=None, help="Required for inferencex; refused for agentx.")
     _add_agentx_options(run)
     run.add_argument("--precision", help="Model precision, as hyperloom optimize spells it.")
+    run.add_argument(
+        "--boot-budget-sec",
+        type=int,
+        default=None,
+        help=(
+            "How long, at least, the server of a test may take to be ready, in seconds, at most"
+            f" {MAX_BOOT_BUDGET_SEC} (6 h); the round raises the server's own start timeout above it."
+            " It only lengthens: a test runs for its trace window, if any, plus 1800 s plus"
+            " this budget when that is longer than its default timeout, and a boot may take this budget when that is"
+            " longer than half of the timeout. Not given, a boot may take half of a test's timeout, which is 3600 s"
+            " for inferencex and the trace window plus 3600 s for agentx."
+        ),
+    )
     run.add_argument(
         "--kernel-optimizer",
         choices=[optimizer.value for optimizer in KernelOptimizer],
@@ -218,11 +249,12 @@ def _add_concurrency_options(run: argparse.ArgumentParser) -> None:
         help="Dev sandboxes lent to the specialists at once, from the cards tests are measured on; 0 = none.",
     )
     run.add_argument(
-        "--make-before-break",
+        "--enable-conc-sweep",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Hosted: keep a finished test's sandbox until the next one runs, where 3+ tests fit (one fewer runs).",
+        help="After CLOSE, sweep the root and the commit FINAL chose over the base's InferenceX recipe concurrencies.",
     )
+    _add_conc_sweep_options(run, concs=(), parallel=DEFAULT_CONC_SWEEP_PARALLEL)
     run.add_argument(
         "--measurement",
         choices=(LOCAL_MEASUREMENT, HOSTED_MEASUREMENT),
@@ -442,7 +474,7 @@ def _agentx_only_errors(args: argparse.Namespace) -> list[str]:
 def _workload_shape(args: argparse.Namespace) -> InferenceXShape | None:
     if WorkloadKind(args.workload) is WorkloadKind.AGENTX:
         return None
-    return InferenceXShape(args.isl, args.osl)
+    return InferenceXShape(args.isl, args.osl, os.environ.get(DATASET_PATH_ENV, "").strip())
 
 
 def _workload_model(args: argparse.Namespace) -> str:
@@ -630,6 +662,7 @@ def settings_from(
         DEFAULT_EP if args.ep is None else args.ep,
         args.agentx_duration_sec,
         AgentXObjective(args.agentx_objective or DEFAULT_AGENTX_OBJECTIVE),
+        args.boot_budget_sec,
     )
     caps = RosterCaps(args.max_branches, args.max_k_per_branch, parallel)
     prompts, agents = args.specialist_prompts or [], args.agents or []
@@ -646,7 +679,6 @@ def settings_from(
         reference_script=_reference_script(args.reference_script, args.framework),
         dev_leases=args.dev_leases,
         playbook=PlaybookMode(args.playbook),
-        make_before_break=args.make_before_break,
         agent_directions=_agent_directions(args.agent_directions, agents),
         agent_pack=_agent_pack(args.agent_pack, agents),
         agent_launch=_agent_launch(args.agent_launch, agents, args.reference_script),
@@ -658,12 +690,45 @@ def settings_from(
         review_gate=args.review_gate,
         inferencex_commit=parse_inferencex_commit(args.inferencex_commit) if args.inferencex_commit else "",
         agentx_early_stop=session_early_stop(os.environ),
+        conc_sweep=args.enable_conc_sweep,
+        conc_sweep_concs=args.conc_sweep_concs,
+        conc_sweep_parallel=args.conc_sweep_parallel,
     )
 
 
+def _add_conc_sweep_options(
+    parser: argparse.ArgumentParser, *, concs: tuple[int, ...] | None, parallel: int | None
+) -> None:
+    """The sweep's points and how many of its tests run at once, defaulting to ``concs`` and ``parallel``; ``None``
+    keeps what the session ran with."""
+    parser.add_argument(
+        "--conc-sweep-concs",
+        type=parse_concurrencies,
+        default=concs,
+        metavar="C1,C2,...",
+        help="The conc sweep's concurrencies, in place of those the base's InferenceX recipe publishes; needed for a"
+        " base no recipe gave. The session's CONC is always among them.",
+    )
+    parser.add_argument(
+        "--conc-sweep-parallel",
+        type=_positive_int,
+        default=parallel,
+        metavar="N",
+        help=f"The conc sweep's tests running at once, within --max-parallel-tests; {DEFAULT_CONC_SWEEP_PARALLEL} runs"
+        " the baseline and the optimized point of a concurrency side by side, 1 runs one test at a time.",
+    )
+
+
+def _positive_int(value: str) -> int:
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError(f"expected a positive integer, got {value}")
+    return number
+
+
 def _limit_errors(args: argparse.Namespace) -> list[str]:
-    """What is wrong with the session's limits: its hours, GPU hours, LLM dollars, judge interval, agent minutes and
-    dev sandboxes."""
+    """What is wrong with the session's limits: its hours, GPU hours, LLM dollars, judge interval, agent minutes, dev
+    sandboxes and boot budget."""
 
     hours, gpu_hours, usd = args.max_hours, args.max_gpu_hours, args.max_llm_usd
     judge, dossier, share = args.judge_interval_sec, args.agent_dossier_minutes, args.agent_share_minutes
@@ -675,7 +740,14 @@ def _limit_errors(args: argparse.Namespace) -> list[str]:
         *_limit_error("--agent-dossier-minutes", dossier, dossier >= 0, "0 (runs no dossier pass) or positive"),
         *_limit_error("--agent-share-minutes", share, share >= 0, "0 (always opens the shares) or positive"),
         *_limit_error("--dev-leases", args.dev_leases, args.dev_leases >= 0, "0 (none) or a positive number"),
+        *_boot_budget_errors(args.boot_budget_sec),
     ]
+
+
+def _boot_budget_errors(budget: int | None) -> list[str]:
+    if budget is None or 0 < budget <= MAX_BOOT_BUDGET_SEC:
+        return []
+    return [f"--boot-budget-sec must be a positive number of seconds, at most {MAX_BOOT_BUDGET_SEC} (6 h)"]
 
 
 def _limit_error(option: str, value: float, in_range: bool, rule: str) -> list[str]:
@@ -718,7 +790,6 @@ __all__ = [
     "HOSTED_MEASUREMENT",
     "PROG",
     "SEQUENCE_LENGTHS",
-    "SESSION_GPU_TYPES",
     "build_parser",
     "refuse_options_beside_resume",
     "settings_from",

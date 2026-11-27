@@ -179,6 +179,18 @@ def test_remove_server_args_accepts_multi_flag_string() -> None:
     assert out == "--keep 4"
 
 
+def test_a_flag_removed_by_name_goes_with_every_value_after_it() -> None:
+    out = remove_server_args("--tp 8 --cuda-graph-bs 1 2 4 8 --mem-fraction-static 0.9", ["--cuda-graph-bs"])
+
+    assert out == "--tp 8 --mem-fraction-static 0.9"
+
+
+def test_a_flag_removed_with_a_value_keeps_another_value() -> None:
+    assert remove_server_args("--chunked-prefill-size 4096", ["--chunked-prefill-size 8192"]) == (
+        "--chunked-prefill-size 4096"
+    )
+
+
 def test_remove_server_args_keeps_a_sibling_json_value_parseable() -> None:
     """Removing one flag must not corrupt a JSON-valued sibling."""
     args = (
@@ -194,6 +206,19 @@ def test_remove_server_args_keeps_a_sibling_json_value_parseable() -> None:
         "exclude_layer": ["*.mlp.gate", "*expert*"],
     }
     assert tokens[2:] == ["--tp", "8"]
+
+
+@pytest.mark.parametrize(
+    ("args", "removal", "left"),
+    [
+        ("-ngl 99 --jinja -md /m.gguf", "--jinja", "-ngl 99 -md /m.gguf"),
+        ("-md /q8.gguf -bs -md /q4.gguf", "-md /q8.gguf", "-bs -md /q4.gguf"),
+        ("--jinja -md /m.gguf -np 1", "--jinja -md", "-np 1"),
+    ],
+)
+def test_remove_server_args_tells_a_short_flag_from_a_value(args, removal, left) -> None:
+    """llama.cpp spells its options with one dash; a removal names them as the server does."""
+    assert remove_server_args(args, [removal]) == left
 
 
 def test_remove_server_args_unbalanced_brace_drops_only_its_own_flag() -> None:

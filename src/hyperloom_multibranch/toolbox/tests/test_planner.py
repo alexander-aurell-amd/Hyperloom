@@ -26,7 +26,7 @@ from hyperloom.measure.compile import EnvironmentCompiler, LocalBlobStore, Packa
 from hyperloom.measure.farm import server_environment
 from hyperloom.measure.points import AcceptedMeasurement, default_canonical
 from hyperloom.measure.tests._recipes import IMAGE, recipe_with
-from hyperloom.orchestrator.actions.executors._workload_envs import default_baseline_config
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import default_baseline_config
 from hyperloom_multibranch.contracts.toolbox import RequestRejected, WorkloadKind
 from hyperloom_multibranch.toolbox.planner import HIT_LOGGING_ON, HostedPlanner
 from hyperloom_multibranch.toolbox.table_hits import read_table_hits
@@ -276,3 +276,35 @@ async def test_a_table_a_hit_names_is_exercised_under_the_planner(tmp_path: Path
     planned = _one_table(read_table_hits(accepted.environment, accepted.points, session.output))
 
     assert (planned.status, planned.rows_hit, planned.hit_lines) == (TABLE_EXERCISED, 1, 1), planned
+
+
+@pytest.mark.parametrize(
+    ("kind", "purpose", "seeded"),
+    [
+        (TestKind.SWEEP, Purpose.HEALTH, True),
+        (TestKind.SWEEP, Purpose.FINAL, False),
+        (TestKind.TEST, Purpose.HEALTH, False),
+    ],
+)
+def test_only_a_concurrency_sweep_seeds_each_level_with_the_recipes_launch_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: TestKind, purpose: Purpose, seeded: bool
+) -> None:
+    """FINAL benches its levels on one server, so they keep the session's own launch."""
+    from types import SimpleNamespace
+
+    from hyperloom.measure.points import CanonicalMeasurement
+    from hyperloom.measure.surface import MeasurementSurface
+    from hyperloom_multibranch.scheduling.requests import integration_test_request
+    from hyperloom_multibranch.toolbox import planner
+
+    frozen = SimpleNamespace(point=SimpleNamespace(source_launches=()))
+    canonical = CanonicalMeasurement(tmp_path / "c.yaml", MeasurementSurface({}), 16, {}, frozen)  # type: ignore[arg-type]
+    taken: list[CanonicalMeasurement] = []
+    monkeypatch.setattr(
+        planner, "accept_measurement", lambda request, parent, compiler, canon, out: taken.append(canon)
+    )
+    request = integration_test_request(kind, purpose, "c0ffee", concurrency=(8, 16, 32))
+
+    HostedPlanner(SimpleNamespace(), canonical, tmp_path / "points").plan(request, None)  # type: ignore[arg-type]
+
+    assert (taken[0].frozen_base is frozen) is seeded

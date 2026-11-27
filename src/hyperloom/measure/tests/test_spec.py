@@ -23,6 +23,7 @@ from hyperloom.measure.tests.bundle_factory import (
 )
 from jsonschema import Draft202012Validator
 
+from hyperloom_common.gpu_card import GpuCard
 from hyperloom.measure import spec as spec_module
 from hyperloom.measure.docs import DocumentError
 from hyperloom.measure.long_context.plan import LongContextPlan
@@ -114,6 +115,8 @@ NEGATIVES: dict[str, Callable[[dict[str, Any]], None]] = {
     "absolute result_dir": lambda d: d["outputs"].update(result_dir="/tmp/out"),
     "zero measure rounds": lambda d: d["procedure"]["rounds"].update(measure=0),
     "unknown prep": lambda d: d["procedure"].update(prep="sweep"),
+    "zero boot budget": lambda d: d["procedure"].update(boot_budget_sec=0),
+    "boot budget not a number": lambda d: d["procedure"].update(boot_budget_sec="3600"),
     "accuracy kind without accuracy": lambda d: d.update(kind="accuracy"),
 }
 
@@ -165,11 +168,14 @@ def test_a_sheet_with_no_build_leaves_the_key_out_so_its_bytes_and_fingerprint_a
 @pytest.mark.parametrize(
     ("change", "reason"),
     [
-        (lambda d: (_built(d), d["environment"].pop("builds")), "each runtime root needs exactly one build"),
+        (
+            lambda d: (_built(d), d["environment"].pop("builds")),
+            r"each runtime or executable root needs exactly one build, .* \(built roots \['sglang'\], builds \[\]\)",
+        ),
         (lambda d: (_built(d), d["environment"]["builds"][0].update(root_id="nowhere")), "each build names a root"),
         (
             lambda d: (_built(d), d["environment"]["builds"].append(dict(d["environment"]["builds"][0]))),
-            "each runtime root needs exactly one build",
+            "each runtime or executable root needs exactly one build",
         ),
         (lambda d: (_built(d), d["environment"]["builds"][0].update(key="k")), "builds"),
         (lambda d: d["environment"].update(builds=[]), "an empty list"),
@@ -182,6 +188,42 @@ def test_a_build_that_does_not_name_exactly_one_runtime_root_is_refused(change: 
 
     with pytest.raises(DocumentError, match=reason):
         MeasurementSpec.from_document(document)
+
+
+def _executable(d: dict[str, Any]) -> None:
+    _built(d)
+    d["environment"]["roots"][0].update(kind="executable", entries=[])
+
+
+def test_an_executable_root_names_its_ready_build_and_lays_no_file() -> None:
+    document = _edit(_executable)
+    spec = MeasurementSpec.from_document(document)
+
+    assert [(r.kind, r.entries) for r in spec.environment.roots] == [("executable", ())]
+    assert MeasurementSpec.from_bytes(spec.to_bytes()) == spec
+    assert list(VALIDATOR.iter_errors(document)) == []
+
+
+@pytest.mark.parametrize(
+    ("change", "reason"),
+    [
+        (
+            lambda d: (_executable(d), d["environment"].pop("builds")),
+            r"each runtime or executable root needs exactly one build, .* \(built roots \['sglang'\], builds \[\]\)",
+        ),
+        (
+            lambda d: (
+                _executable(d),
+                d["environment"]["roots"][0]["entries"].append({"path": "x.py", "op": "delete"}),
+            ),
+            "an executable root lays no file over a package",
+        ),
+    ],
+    ids=["without-build", "with-entries"],
+)
+def test_an_executable_root_without_its_build_or_with_files_is_refused(change: Any, reason: str) -> None:
+    with pytest.raises(DocumentError, match=reason):
+        MeasurementSpec.from_document(_edit(change))
 
 
 def test_a_package_root_may_name_the_build_of_its_jit_modules() -> None:
@@ -574,6 +616,53 @@ def test_a_sheet_that_asks_for_the_short_prompt_check_carries_the_plan_and_the_s
     assert spec.procedure.short_prompts is not None and spec.procedure.short_prompts.max_new_tokens == 32
     assert list(VALIDATOR.iter_errors(document)) == []
     assert MeasurementSpec.from_bytes(spec.to_bytes()) == spec
+
+
+def test_a_sheet_that_gives_the_boot_a_budget_carries_it_and_the_schema_allows_it() -> None:
+    document = _edit(lambda d: d["procedure"].update(boot_budget_sec=5400))
+
+    spec = MeasurementSpec.from_document(document)
+
+    assert spec.procedure.boot_budget_sec == 5400
+    assert list(VALIDATOR.iter_errors(document)) == []
+    assert MeasurementSpec.from_bytes(spec.to_bytes()) == spec
+
+
+CARD = GpuCard("AMD Instinct MI355X", "75a3", "gfx950", 256, 294912, 8000.0, 2400)
+
+
+def _with_card(**changes: Any) -> dict[str, Any]:
+    return _edit(lambda d: d["hardware"].update(card={**dataclasses.asdict(CARD), **changes}))
+
+
+def test_a_sheet_carries_the_session_s_card_as_its_reader_reads_it_and_the_schema_allows_it() -> None:
+    document = _with_card()
+
+    spec = MeasurementSpec.from_document(document)
+
+    assert spec.hardware.card == CARD
+    assert list(VALIDATOR.iter_errors(document)) == []
+    assert MeasurementSpec.from_bytes(spec.to_bytes()) == spec
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"gfx": ""}, "gfx: expected a non-empty string"),
+        ({"compute_units": 0}, "compute_units: must be at least 1"),
+        ({"memory_mib": "294912"}, "memory_mib: expected an integer"),
+        ({"engine_clock_mhz": 0}, "engine_clock_mhz: must be at least 1"),
+        ({"memory_bandwidth_gbps": -1}, "memory_bandwidth_gbps: must be at least 0"),
+        ({"name": None}, "name: expected a string"),
+        ({"revision": "c1"}, "unknown key 'revision'"),
+    ],
+)
+def test_a_card_that_breaks_its_contract_is_refused_by_the_reader_and_the_schema(change, message) -> None:
+    document = _with_card(**change)
+
+    with pytest.raises(DocumentError, match=message):
+        MeasurementSpec.from_document(document)
+    assert list(VALIDATOR.iter_errors(document)) != []
 
 
 def test_a_sheet_that_asks_for_none_has_no_such_key_so_its_bytes_and_hash_are_unchanged() -> None:

@@ -20,7 +20,7 @@ from hyperloom.orchestrator.state.task_registry import TaskNotFound
 from hyperloom.orchestrator.loop.coordinator import Coordinator
 from ._optimize_fixtures import optimize_state
 from .conftest import make_coordinator
-from hyperloom.orchestrator.phases.framework import AuthoringRetry
+from hyperloom.orchestrator.phases.framework_reauthor import AuthoringRetry
 
 
 def test_the_capped_phases_spend_the_session_on_the_work_phases():
@@ -28,7 +28,9 @@ def test_the_capped_phases_spend_the_session_on_the_work_phases():
     budget = _phase_state.DEFAULT_PHASE_BUDGET_PCT
     # ENABLEMENT is uncapped by design: a combo that cannot run has nothing to
     # optimise, so a share of the optimisation budget is the wrong unit for it.
-    assert set(budget) == set(_phase_state.PHASE_NAMES) - {_phase_state.PHASE_ENABLEMENT}
+    # CYCLE_END only drains and validates on entry, which the session budget alone gates.
+    uncapped = {_phase_state.PHASE_ENABLEMENT, _phase_state.PHASE_CYCLE_END}
+    assert set(budget) == set(_phase_state.PHASE_NAMES) - uncapped
     assert sum(budget.values()) <= 1.0
     # How the two work phases divide their share is a tuning call; that the session is spent on them rather than on
     # setup and wind-down is not.
@@ -180,7 +182,7 @@ def test_a_failed_local_explore_specialist_is_retried(tmp_path: Path):
 
 def test_a_repeatedly_failing_local_explore_specialist_stops(tmp_path: Path):
     """Retrying is bounded: exhausting all attempts stops dispatching."""
-    from hyperloom.orchestrator.phases.framework import _LOCAL_EXPLORE_MAX_ATTEMPTS
+    from hyperloom.orchestrator.phases.framework_local_explore import _LOCAL_EXPLORE_MAX_ATTEMPTS
 
     stub = _stub(tmp_path, local_explore=True)
     stub.shared_state.framework_agent_empty_discoveries = framework_discovery.DISCOVER_FAILURE_RETRY_LIMIT
@@ -293,7 +295,7 @@ def test_rounds_that_return_only_config_proposals_still_run_the_arm_dry(tmp_path
 
 
 def test_forward_enablement_carriers_eval_origin():
-    from hyperloom.orchestrator.phases.framework import _forward_enablement_carriers
+    from hyperloom.orchestrator.phases.framework_proposals import _forward_enablement_carriers
 
     src = {
         "enablement_origin": "eval",
@@ -312,7 +314,7 @@ def test_forward_enablement_carriers_eval_origin():
 
 
 def test_forward_enablement_carriers_boot_origin_noop():
-    from hyperloom.orchestrator.phases.framework import _forward_enablement_carriers
+    from hyperloom.orchestrator.phases.framework_proposals import _forward_enablement_carriers
 
     dst: dict[str, Any] = {}
     _forward_enablement_carriers({}, dst)
@@ -321,31 +323,6 @@ def test_forward_enablement_carriers_boot_origin_noop():
     dst2 = {"config_path": "/keep.yaml"}
     _forward_enablement_carriers({"enablement_origin": ""}, dst2)
     assert dst2 == {"config_path": "/keep.yaml"}
-
-
-def test_dispatched_verdict_reaches_the_integrate_task():
-    """The integrate task derives its rungs from the verdict, so a boot-origin round must carry it."""
-    from hyperloom.common.failure_signature import classify_failure
-    from hyperloom.orchestrator.actions.executors._enablement_config import _enablement_gap
-    from hyperloom.orchestrator.phases.framework import _forward_enablement_carriers
-
-    signature = classify_failure("ValueError: Model architectures ['Glm5ForCausalLM'] are not supported for now.")
-    dst: dict[str, Any] = {"enablement": True}
-    _forward_enablement_carriers({"enablement_failure_signature": signature.to_dict()}, dst)
-
-    gap = _enablement_gap(dst)
-    assert gap is not None
-    assert gap.kind == "missing_model_arch"
-
-
-def test_a_resource_constraint_verdict_acquires_no_code():
-    """An OOM is the host being too small, so the integrate task has no gap to acquire code for."""
-    from hyperloom.common.failure_signature import RESOURCE_CONSTRAINT, classify_failure
-    from hyperloom.orchestrator.actions.executors._enablement_config import _enablement_gap
-
-    signature = classify_failure("RuntimeError: Out of memory on GPU. Tried to allocate 80 GiB")
-    assert signature.kind == RESOURCE_CONSTRAINT
-    assert _enablement_gap({"enablement": True, "enablement_failure_signature": signature.to_dict()}) is None
 
 
 # --------------------------------------------------------------------------- # Stage-3 guard: local_explore gap is

@@ -54,17 +54,9 @@ class ContextProvider:
         """Return the warm-start summary projection."""
         return self._safe(self.shared_state.to_warm_start_summary, "warm_start")
 
-    def proposal_scores(self) -> str:
-        """Return the proposal-scores summary projection."""
-        return self._safe(self.shared_state.to_proposal_scores_summary, "proposal_scores")
-
     def intervention_mix(self) -> str:
         """Return the intervention-mix summary projection."""
         return self._safe(self.shared_state.to_intervention_mix_summary, "intervention_mix")
-
-    def why_denied(self, top_k: int = 6) -> str:
-        """Return a summary of recent policy denials."""
-        return self._safe(lambda: self.shared_state.to_policy_denial_summary(top_k=top_k), "why_denied")
 
     def analysis_md(self) -> str:
         """Return the current ``analysis.md`` contents."""
@@ -194,26 +186,11 @@ CONTEXT_TOOL_SPECS: tuple[tuple[str, str, dict[str, Any], str], ...] = (
         "warm_start",
     ),
     (
-        "get_proposal_scores",
-        "Return the advisory multi-rater proposal scores for the most "
-        "recent specialist round (0-10 likelihood-of-gain priors). "
-        "Advisory only — never a ranking directive.",
-        _NO_ARGS_SCHEMA,
-        "proposal_scores",
-    ),
-    (
         "get_intervention_mix",
         "Return the config-vs-code_patch intervention-mix telemetry "
         "(how many config keeps vs source-patch keeps so far).",
         _NO_ARGS_SCHEMA,
         "intervention_mix",
-    ),
-    (
-        "why_denied",
-        "Return the most recent PolicyGate denials (action / rule / hint) "
-        "so you can see why a proposed intent was rejected and self-correct.",
-        _TOPK_SCHEMA,
-        "why_denied",
     ),
     (
         "show_analysis_md",

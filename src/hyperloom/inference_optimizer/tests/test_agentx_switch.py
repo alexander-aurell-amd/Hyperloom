@@ -12,7 +12,7 @@ import sys
 
 import yaml
 
-from hyperloom.orchestrator.actions.executors import _workload_envs as we
+from hyperloom.orchestrator.actions.executors.workload import _workload_envs as we
 
 _AGENTX_ENV_KEYS = (
     "HYPERLOOM_AGENTX",
@@ -101,7 +101,7 @@ def test_switch_off_omits_workload_spec(tmp_path, monkeypatch):
 
 def test_runtime_overrides_off_keeps_the_point_script(monkeypatch):
     _clear_env(monkeypatch)  # HYPERLOOM_AGENTX cleared => OFF
-    from hyperloom.orchestrator.actions.executors._benchmark_runtime import (
+    from hyperloom.orchestrator.actions.executors.workload._benchmark_runtime import (
         apply_runtime_benchmark_overrides,
     )
 
@@ -114,9 +114,9 @@ def test_runtime_overrides_off_keeps_the_point_script(monkeypatch):
 _PROBE_OFF = """
 import sys
 from pathlib import Path
-from hyperloom.orchestrator.actions.executors import _grid_runner  # noqa: F401
+from hyperloom.orchestrator.actions.executors.grid import _grid_runner  # noqa: F401
 from hyperloom.common.perf_metric import agentx_enabled
-from hyperloom.orchestrator.actions.executors import _workload_envs as we
+from hyperloom.orchestrator.actions.executors.workload import _workload_envs as we
 
 assert not agentx_enabled()
 we.materialize_config_with_envs(
@@ -191,6 +191,17 @@ def test_switch_on_mlperf_backend_pins_client_and_port(tmp_path, monkeypatch):
     assert bench["envs"]["MLPERF_AGENTIC_FLOW"] == "smoke_test"
     assert bench["envs"]["AGENTIC_NUM_TRAJECTORIES"] == "150"
     assert "--served-model-name kimi-k3" in bench["envs"]["EXTRA_SGLANG_ARGS"]
+
+
+def test_mlperf_hardware_names_the_session_label(tmp_path, monkeypatch):
+    _clear_env(monkeypatch)
+    monkeypatch.setenv("HYPERLOOM_AGENTX", "1")
+    monkeypatch.setenv("HYPERLOOM_AGENTIC_BACKEND", "mlperf")
+    monkeypatch.delenv("MLPERF_AGENTIC_HARDWARE", raising=False)
+    monkeypatch.setenv("GPU_TYPE", "mi325x")
+    src = _write(tmp_path / "base.yaml", framework="sglang")
+    bench = _materialize(src, tmp_path / "out", target=we.BenchmarkTarget(model_path="/m"))
+    assert bench["envs"]["MLPERF_AGENTIC_HARDWARE"] == "mi325x"
 
 
 def test_mlperf_concurrency_follows_the_round_not_the_baseline(tmp_path, monkeypatch):

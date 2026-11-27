@@ -20,8 +20,9 @@ import pytest
 import yaml
 
 from hyperloom.inference_optimizer.session.paths import asset_root
-from hyperloom.orchestrator.actions.executors import _patch_laying, _server_patcher
-from hyperloom.orchestrator.actions.executors._workload_envs import materialize_config_with_envs
+from hyperloom.orchestrator.actions.executors.patching import _patch_laying
+from hyperloom.orchestrator.actions.executors import _server_patcher
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import materialize_config_with_envs
 
 _PATCH_TREE = ("examples", "custom_workflows", "inference_analysis")
 
@@ -471,3 +472,19 @@ def test_the_copy_mirrors_the_vllm_image_checkout_the_launch_puts_on_the_path_an
     assert _serve(install, path, "CANDIDATE")[1], "of the checkout's files, not the wheel's"
     assert {path: path.read_bytes() for path in checkout.rglob("*") if path.is_file()} == checked_out
     assert install.snapshot() == before
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected"),
+    [
+        ("/opt/tracelens/TraceLens/TraceUtils/kernel_shape_tool", True),
+        ("/opt/tracelens/TraceLens/TraceUtils/kernel_shape_tool/", True),
+        ("TraceLens/TraceUtils/kernel_shape_tool", True),
+        ("/opt/tracelens/Other/TraceUtils/kernel_shape_tool", False),
+        ("/opt/tracelens/TraceLens/TraceUtils/kernel_shape_tool/extra", False),
+        ("/opt/kernel_shape_tool", False),
+        ("", False),
+    ],
+)
+def test_only_the_tracelens_shape_tool_dir_is_recognized_on_the_import_path(entry, expected) -> None:
+    assert _server_patcher.is_kernel_shape_tool(entry) is expected

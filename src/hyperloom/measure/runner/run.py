@@ -32,6 +32,7 @@ from hyperloom.measure.docs import DocumentError
 from hyperloom.measure.failures import (
     DISK_FULL,
     FOREIGN_PROCESS_ON_CARD,
+    FRAMEWORK_VERSION_MISMATCH,
     Disposition,
     FailureClassification,
     FailureEvidence,
@@ -60,17 +61,20 @@ from hyperloom.measure.attachments import AttachmentError, place_attachments
 from hyperloom.measure.farm import (
     Farm,
     FarmError,
+    FrameworkVersionMismatch,
     build_farm,
     built_roots,
     inherited_environment,
     lay_profile_patch,
     patched_configs,
+    prepend_base_bins,
     record_unpatched,
     server_environment,
     server_python,
     verify_farm,
 )
 from hyperloom.measure.runner.jit import STAGING_DIR, ColdStart, Surroundings, build_session, card_arch, cold_start
+from hyperloom.measure.runner.datasets_cache import DatasetsNeeded, datasets_needed, local_datasets_cache
 from hyperloom.measure.runner.import_outcome import clear_import_notes, install_import_watch, refine_imports
 from hyperloom.measure.runner.jit_outcome import refine_outcome
 from hyperloom.measure.runner.native.prewarm import preflight_build
@@ -86,6 +90,8 @@ from hyperloom.measure.runner.service import Progress, RunnerFailure, join_notes
 from hyperloom.measure.runner.snapshot import SnapshotError, check_snapshot
 from hyperloom.measure.runner.cache_layout import CACHE_ENV, DEFAULT_CACHE_DIR
 from hyperloom.measure.runner.tools import (
+    INFERENCEX_STORE,
+    TOOL_CHECKOUTS_DIR,
     StagingMismatch,
     ToolError,
     ensure_inference_suite,
@@ -100,6 +106,7 @@ from hyperloom.orchestrator.actions.executors._aiter_serving_once import build_i
 from hyperloom.sandbox.card_occupancy import card_guard, own_sandbox_processes
 from inference_suite.contracts import NormalisedManifest
 from inference_suite.frameworks import Framework, FrameworkKind, framework_facts
+from inference_suite import inferencex_root
 
 __all__ = ["run"]
 
@@ -269,12 +276,12 @@ def _preflight(ctx: _Context, spec: MeasurementSpec, visible: list[int]):
     facts = hardware.read_gpu_facts(visible)
     problems = _image_problems(ctx, spec.image.digest)
     if facts is None:
-        ctx.notes.append("GPU model, power cap and partition mode could not be read; they were not compared")
+        ctx.notes.append("the GPUs' card, power cap and partition mode could not be read; they were not compared")
     else:
         h = spec.hardware
         problems += hardware.check_hardware(
             facts,
-            gpu_type=h.gpu_type,
+            card=h.card,
             gpu_count=h.gpu_count,
             power_cap_w=h.power_cap_w,
             partition_mode=h.partition_mode,
@@ -295,9 +302,11 @@ def _surface_sha256(points: list[Path]) -> str:
 def _prepare(ctx: _Context, spec: MeasurementSpec) -> tuple[list[Path], Path, Farm | None]:
     """Tools, attachments, farm and the rewritten YAML; returns the point path and the InferenceX checkout."""
     try:
-        inferencex = ensure_inferencex(spec.tools.inferencex, ctx.cache)
+        runner_cache = Path(ctx.environ.get(CACHE_ENV) or DEFAULT_CACHE_DIR)
+        inferencex = ensure_inferencex(
+            spec.tools.inferencex, ctx.cache, runner_cache / TOOL_CHECKOUTS_DIR / INFERENCEX_STORE
+        )
         if spec.tools.staging is not None:
-            runner_cache = Path(ctx.environ.get(CACHE_ENV) or DEFAULT_CACHE_DIR)
             staged = ensure_inference_suite(runner_cache, spec.tools.staging)
             ctx.environ[TOOL_CACHE_ENV], ctx.staging = str(staged.tool_cache), staged.normalised
     except StagingMismatch as exc:
@@ -307,12 +316,13 @@ def _prepare(ctx: _Context, spec: MeasurementSpec) -> tuple[list[Path], Path, Fa
     try:
         placed = place_attachments(spec.attachments, ctx.work / "attach", ctx.read_blob)
         python = server_python(yaml.safe_load(spec.config[0].yaml) or {}, default="python3")
+        inherited = inherited_environment(ctx.environ, spec.process_env, spec.unset_envs)
         farm = build_farm(
             built_roots(spec.environment.roots, _sheet_builds(spec, ctx.environ)),
             ctx.work / "farm",
             python=python,
             read_blob=ctx.read_blob,
-            inherited=inherited_environment(ctx.environ, spec.process_env, spec.unset_envs),
+            inherited=inherited,
         )
         unpatched = (
             lay_profile_patch(farm, yaml.safe_load(spec.config[0].yaml) or {}) if spec.kind == _PROFILE else None
@@ -328,6 +338,7 @@ def _prepare(ctx: _Context, spec: MeasurementSpec) -> tuple[list[Path], Path, Fa
             visible_devices=ctx.environ.get(ROCR_VISIBLE_DEVICES_ENV),
             farm=farm,
             path=ctx.environ.get("PATH"),
+            inherited=inherited,
         )
         points = [
             rewrite_config(point.yaml, ctx.work / f"point_{index}.yaml", placement)
@@ -339,9 +350,19 @@ def _prepare(ctx: _Context, spec: MeasurementSpec) -> tuple[list[Path], Path, Fa
         if farm is not None:
             for point in points:
                 verify_farm(farm, server_environment(yaml.safe_load(point.read_text())), python=python, cwd=ctx.work)
+    except FrameworkVersionMismatch as exc:
+        # Before the generic refusal: the sheet is sound, the image this sandbox runs is not the one it was compiled on.
+        raise RunnerFailure(FRAMEWORK_VERSION_MISMATCH, str(exc)) from exc
     except (AttachmentError, FarmError, NativeLayError, ValueError) as exc:
         raise RunnerFailure(_SPEC_REJECTED, str(exc)) from exc
     return points, inferencex, farm
+
+
+def _prepend_base_bins(environ: MutableMapping[str, str]) -> None:
+    try:
+        prepend_base_bins(environ)
+    except FarmError as exc:
+        raise RunnerFailure(_START_FAILED, str(exc)) from exc
 
 
 def _sheet_builds(spec: MeasurementSpec, environ: Mapping[str, str]) -> SheetBuilds | None:
@@ -377,6 +398,7 @@ def _call(ctx: _Context, spec: MeasurementSpec, points: list[Path], inferencex: 
         accuracy=p.accuracy,
         result_dir=str(ctx.files / spec.outputs.result_dir),
         silence_timeout_sec=p.silence_timeout_sec,
+        boot_budget_sec=p.boot_budget_sec,
         on_output=progress.touch,
         env_overrides=dict(spec.process_env),
         unset_envs=spec.unset_envs,
@@ -386,6 +408,24 @@ def _call(ctx: _Context, spec: MeasurementSpec, points: list[Path], inferencex: 
         short_prompts=p.short_prompts,
         long_context=p.long_context,
         checkpoint=p.checkpoint,
+    )
+
+
+def _less_spent(call: TestCall, spec: MeasurementSpec, spent: float) -> TestCall:
+    """``call`` with the seconds its datasets' link tree took (``datasets_cache``) taken off its timeout; a sheet's
+    deadline counted them already. Called only when a tree was built, so a test without one keeps its sheet's timeout."""
+    return dataclasses.replace(call, timeout_sec=int(max(1, min(call.timeout_sec, spec.procedure.timeout_sec - spent))))
+
+
+def _datasets_needed(ctx: _Context, spec: MeasurementSpec) -> DatasetsNeeded:
+    """The datasets the test loads through ``datasets`` (``datasets_cache``), named through this runner's staging."""
+    tool_cache = ctx.environ.get(TOOL_CACHE_ENV) if ctx.staging is not None else None
+    base = spec.procedure.base_launch
+    return datasets_needed(
+        (point.yaml for point in spec.config),
+        base_client_env=dict(base.client.env) if base is not None and base.client is not None else {},
+        accuracy=spec.procedure.accuracy,
+        staged_root=inferencex_root(Path(tool_cache)) if tool_cache else None,
     )
 
 
@@ -502,7 +542,7 @@ def _write_bundle(ctx: _Context, signed: _Signed, outcome: dict, found: _Finding
                 "signing_key_fingerprint": signing.public_key_fingerprint(pem),
                 "node_name": ctx.environ.get("NODE_NAME"),
                 "image_digest": spec.image.digest,
-                "gpu_model": first.model if first else None,
+                "gpu_model": (first.card.name or None) if first else None,
                 "power_cap_w": first.power_cap_w if first else None,
                 "partition_mode": first.partition_mode if first else None,
                 "hyperloom_version": _version(),
@@ -549,7 +589,8 @@ def _build_image_own_once() -> None:
     their own, so a module only they built would be built again by every later test. The test's directories, made after
     this, link what was built. The test's own tables and build variables are not what is checked: the test is not given
     a module they make stale (``own_jit``), and a module moved aside for them would stay out of the image for every later
-    test. A check that cannot run is logged and the servers build what they lack, as they would without it."""
+    test. A check that cannot run is logged and the servers build what they lack, as they would without it. One line
+    per test says what the preflight decided, so a log shows it ran even when it moved and built nothing."""
     try:
         preflight = build_image_own_once(preflight_build)
     except OSError as exc:
@@ -557,6 +598,8 @@ def _build_image_own_once() -> None:
         return
     if preflight.outcome.get("action") == "invalidate":
         log.warning("aiter serving preflight before the test: %s", preflight.summary())
+    else:
+        log.info("aiter serving preflight before the test: %s", preflight.summary())
 
 
 def _jit_session(
@@ -616,13 +659,20 @@ def _run_sheet(ctx: _Context, spec_path: Path, key, progress: Progress) -> None:
     _build_image_own_once()
     session = _jit_session(ctx, spec, points, farm, facts)
     arch = card_arch(spec, facts[0] if facts else None)
-    call = _own_directories(ctx, _call(ctx, spec, points, inferencex, progress), session, farm, arch)
-    clear_import_notes(farm)
-    ctx.cards.check(BEFORE_TEST)
-    ctx.cards.enforce_guard()
-    progress.phase("running")
-    started = time.time()
-    outcome, timed_out = _execute_watched(ctx, call)
+    linking = time.monotonic()
+    with local_datasets_cache(
+        ctx.environ, ctx.work, lambda: _datasets_needed(ctx, spec), ctx.notes, sheet_env=spec.process_env
+    ) as tree:
+        call = _call(ctx, spec, points, inferencex, progress)
+        if tree is not None:
+            call = _less_spent(call, spec, time.monotonic() - linking)
+        call = _own_directories(ctx, call, session, farm, arch)
+        clear_import_notes(farm)
+        ctx.cards.check(BEFORE_TEST)
+        ctx.cards.enforce_guard()
+        progress.phase("running")
+        started = time.time()
+        outcome, timed_out = _execute_watched(ctx, call)
     if outcome is not None:
         ctx.notes.extend(outcome.notes)
     ctx.cards.enforce_guard()
@@ -721,6 +771,7 @@ def run(
         try:
             key = _load_key(environ)
             take_topology(environ)
+            _prepend_base_bins(environ)
             _check_cards_free(ctx, _visible(environ))
             progress.phase("waiting_spec")
             if not wait_for_file(in_dir / "READY", spec_wait_sec):

@@ -8,7 +8,12 @@ from __future__ import annotations
 from pathlib import Path
 
 
-from hyperloom.common.launch_log_evidence import launch_argv_from_log, split_launch_flags
+from hyperloom.common.launch_log_evidence import (
+    launch_argv_from_log,
+    observed_model_binding_from_log,
+    operand_digest,
+    split_launch_flags,
+)
 
 
 # ── split_launch_flags ────────────────────────────────────────────────────
@@ -139,6 +144,65 @@ def test_a_model_prefixed_flag_does_not_pass_the_gate(tmp_path: Path) -> None:
     assert launch_argv_from_log(str(log), "vllm") == ""
 
 
+#: vLLM 0.33 and 0.34 log this at INFO when started without ``--enable-scale-out``.
+_VLLM_SCALE_OUT_HINT = (
+    "(APIServer pid=157627) INFO 11-18 01:58:50 [factories.py:105] Scale-out endpoints are disabled. "
+    "Restart vllm serve with --enable-scale-out to enable them.\n"
+)
+
+
+def test_vllm_advice_that_names_its_own_command_is_not_a_launch_line(tmp_path: Path) -> None:
+    """``with`` passes the gate as the ``serve`` operand, and the rest of the
+    sentence is prose, not launch flags."""
+    log = tmp_path / "server.log"
+    log.write_text(_VLLM_SCALE_OUT_HINT, encoding="utf-8")
+    assert launch_argv_from_log(str(log), "vllm") == ""
+    assert observed_model_binding_from_log(str(log), "vllm") == {}
+
+
+def test_a_launch_line_after_vllm_advice_is_still_read(tmp_path: Path) -> None:
+    log = tmp_path / "server.log"
+    log.write_text(
+        _VLLM_SCALE_OUT_HINT + "INFO: vllm serve /models/glm5 --max-num-seqs 256 --enable-chunked-prefill\n",
+        encoding="utf-8",
+    )
+    assert launch_argv_from_log(str(log), "vllm") == "--max-num-seqs 256 --enable-chunked-prefill"
+
+
+def test_a_list_flag_keeps_its_numeric_operands(tmp_path: Path) -> None:
+    log = tmp_path / "server.log"
+    log.write_text(
+        "INFO: python3 -m sglang.launch_server --model-path /models/glm5 --cuda-graph-bs 1 2 4\n", encoding="utf-8"
+    )
+    assert launch_argv_from_log(str(log), "sglang") == "--cuda-graph-bs 1 2 4"
+
+
+def test_a_list_flag_with_word_operands_reads_as_prose(tmp_path: Path) -> None:
+    """The reader's stated limit: a plain word after a flag's first operand is
+    prose, so this launch is left to the engine's own record."""
+    log = tmp_path / "server.log"
+    log.write_text("INFO: vllm serve /models/glm5 --ignore-patterns README LICENSE\n", encoding="utf-8")
+    assert launch_argv_from_log(str(log), "vllm") == ""
+
+
+def test_vllm_advice_leaves_the_launch_to_the_engine_record(tmp_path: Path) -> None:
+    from hyperloom.orchestrator.actions.executors.workload._launch_evidence import (
+        RequestedLaunch,
+        build_launch_evidence,
+    )
+
+    config, slot, log = _vllm_slot(tmp_path, _VLLM_SCALE_OUT_HINT + _VLLM_NON_DEFAULT)
+    evidence = build_launch_evidence(
+        RequestedLaunch(config, "vllm", model_path="/models/m"),
+        actual_server_log=log,
+        slot=slot,
+    )
+    assert evidence["observed_server_launch_flags"] == ""
+    assert evidence["observed_server_identity"]["tensor_parallel_size"] == 4
+    assert evidence["observed_model_binding"]["model_digest"] == operand_digest("/models/m")
+    assert evidence["observed_model_binding"]["tp"] == "4"
+
+
 def test_sglang_model_path_still_passes_the_gate(tmp_path: Path) -> None:
     log = tmp_path / "server.log"
     log.write_text(
@@ -202,7 +266,7 @@ def test_the_vllm_binding_carries_the_width_and_digests_the_model(tmp_path: Path
     import hashlib
 
     from hyperloom.common.launch_log_evidence import observed_server_identity_from_log
-    from hyperloom.orchestrator.actions.executors._launch_evidence import _binding_from_vllm_identity
+    from hyperloom.orchestrator.actions.executors.workload._launch_evidence import _binding_from_vllm_identity
 
     log = tmp_path / "server.log"
     log.write_text(_VLLM_NON_DEFAULT, encoding="utf-8")
@@ -241,7 +305,10 @@ def test_a_vllm_launch_reaches_the_evidence_through_the_production_entry_point(t
     through the production entry point, which is the only thing that fails when
     the branch is removed.
     """
-    from hyperloom.orchestrator.actions.executors._launch_evidence import RequestedLaunch, build_launch_evidence
+    from hyperloom.orchestrator.actions.executors.workload._launch_evidence import (
+        RequestedLaunch,
+        build_launch_evidence,
+    )
 
     config, slot, log = _vllm_slot(
         tmp_path,
@@ -263,7 +330,10 @@ def test_a_quoted_marker_is_not_accepted_as_a_vllm_launch_through_the_entry_poin
     """User- or attacker-supplied text echoed into the log quotes the marker
     but carries no launch record; binding to it reports settings the server
     never ran with."""
-    from hyperloom.orchestrator.actions.executors._launch_evidence import RequestedLaunch, build_launch_evidence
+    from hyperloom.orchestrator.actions.executors.workload._launch_evidence import (
+        RequestedLaunch,
+        build_launch_evidence,
+    )
 
     config, slot, log = _vllm_slot(
         tmp_path,
@@ -281,7 +351,10 @@ def test_a_quoted_marker_is_not_accepted_as_a_vllm_launch_through_the_entry_poin
 def test_a_preceding_dict_does_not_displace_the_real_vllm_record(tmp_path):
     """Extraction anchored at the line's first brace reads an unrelated dict
     and ignores the actual record that follows it on the same line."""
-    from hyperloom.orchestrator.actions.executors._launch_evidence import RequestedLaunch, build_launch_evidence
+    from hyperloom.orchestrator.actions.executors.workload._launch_evidence import (
+        RequestedLaunch,
+        build_launch_evidence,
+    )
 
     config, slot, log = _vllm_slot(
         tmp_path,
@@ -299,7 +372,10 @@ def test_a_preceding_dict_does_not_displace_the_real_vllm_record(tmp_path):
 def test_a_brace_inside_a_vllm_model_path_does_not_truncate_the_record(tmp_path):
     """A ``}`` inside a string is not structure; ending the payload there drops
     every field after it, including the parallelism the decision compares."""
-    from hyperloom.orchestrator.actions.executors._launch_evidence import RequestedLaunch, build_launch_evidence
+    from hyperloom.orchestrator.actions.executors.workload._launch_evidence import (
+        RequestedLaunch,
+        build_launch_evidence,
+    )
 
     config, slot, log = _vllm_slot(
         tmp_path,
@@ -316,7 +392,7 @@ def test_a_brace_inside_a_vllm_model_path_does_not_truncate_the_record(tmp_path)
 def test_a_failing_server_log_reader_propagates_from_the_entry_point(tmp_path, monkeypatch):
     import pytest
 
-    from hyperloom.orchestrator.actions.executors import _launch_evidence as evidence_module
+    from hyperloom.orchestrator.actions.executors.workload import _launch_evidence as evidence_module
 
     def _boom(*_args, **_kwargs):
         raise RuntimeError("log reader bug")

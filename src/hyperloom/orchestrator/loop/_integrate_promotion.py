@@ -12,7 +12,7 @@ from hyperloom_common.coerce import to_str_list
 from hyperloom.inference_optimizer.breakdown.stop_reasons import PATCH_RECOVERY_INCOMPLETE_STOP_REASON
 from hyperloom.inference_optimizer.session.optimization_journal import Verdict
 
-from ..actions.executors._integrate_vocabulary import KEEP_STATUSES
+from ..actions.executors.integrate._integrate_vocabulary import KEEP_STATUSES
 from ..launch_controls import LAUNCH_CONTROL_KEYS
 from ..measurement.integrate_performance import integrate_measurement_fields
 from ..measurement.runtime_findings import KEEP_REASON_CORRECTNESS_FIX
@@ -419,21 +419,3 @@ class IntegratePromotionMixin:
                 watermark_reason="integrate_patch_keep_watermark",
             )
         return lifted
-
-    async def _promote_conc_sweep(
-        self,
-        result: dict,
-        task: "Task | None",
-        outcome: _PromoteOutcome,
-    ) -> None:
-        """Promote a conc_sweep result: record_conc_sweep + save; discovery-only.
-
-        No audit attempt is written: ``record_action_attempt`` returns early for
-        any kind outside ``_AUDIT_ACTIONS``, which conc_sweep is not in. The
-        conc_sweep event carries the skip reason, the budget verdict and the
-        summary instead.
-        """
-        outcome.early_return = True
-        # Write last_conc_sweep so the SWEEP exit logic can distinguish an honest sweep_done from a no-pair sweep_failed.
-        self.shared_state.record_conc_sweep(result)
-        self.shared_state.save(self.session_dir)

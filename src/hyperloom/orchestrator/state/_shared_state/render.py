@@ -14,9 +14,12 @@ from hyperloom_common.coerce import to_float
 from hyperloom.common.prompt_safety import flatten_for_prompt as _flatten_for_prompt
 from hyperloom.inference_optimizer.breakdown.recorder.kernel_records import GEAK_DROPPED_STATUSES
 from hyperloom.inference_optimizer.grid_server_args import dedupe_extra_server_args
-from hyperloom.inference_optimizer.session.geak_rebench_verdict import REBENCH_FAILED_STATUSES
+from hyperloom.inference_optimizer.session.geak_rebench_verdict import (
+    REBENCH_FAILED_STATUSES,
+    REBENCH_UNMEASURED_GIVEN_UP,
+)
 from ...mcp_tool_names import qualified_context_tool_name
-from . import gap_rows, proposal_scores, variant_line, warm_start
+from . import gap_rows, variant_line, warm_start
 from .attempt_audit import _AUDIT_ACTIONS
 from .phase_state import GAP_SEVERITY_RANK
 
@@ -27,7 +30,6 @@ _FAILURE_EXCERPT_CHARS = 600
 _WARM_START_MAX_LINES = 12
 _GAPS_MAX_ENTRIES = 10
 _UNTESTED_PROPOSALS_MAX_ENTRIES = 12
-_PROPOSAL_SCORE_ROUNDS = 2
 
 # Ordered (key, label) projection for advisory ``model_arch``; empty/None keys dropped.
 _MODEL_ARCH_STRUCTURED_FIELDS: tuple[tuple[str, str], ...] = (
@@ -167,28 +169,6 @@ def untested_proposal_line(row: dict[str, Any], *, why_chars: int | None = 80) -
 
 
 class _RenderMixin:
-    def to_policy_denial_summary(self, *, top_k: int = 6) -> str:
-        """Render the most recent PolicyGate denials for prompt injection.
-
-        Args:
-            top_k (int): Maximum number of newest denial rows to render.
-
-        Returns:
-            str: A ``=== Recent policy denials ===`` block, or ``""`` when
-                no denials have been recorded.
-        """
-        if not self.policy_denial_history:
-            return ""
-        rows = list(self.policy_denial_history)[-top_k:]
-        lines = [f"=== Recent policy denials (newest last, total={len(self.policy_denial_history)}) ==="]
-        for r in rows:
-            lines.append(
-                f"  tick={r.get('tick')} action={r.get('action_name')!r} "
-                f"rule={r.get('rule')!r} streak={r.get('streak')} "
-                f"hint={str(r.get('hint') or '')[:140]!r}"
-            )
-        return "\n".join(lines)
-
     def to_intervention_mix_summary(self) -> str:
         """Render the intervention ledger as a one-line counts summary (``\"\"`` when empty)."""
         mix = self.intervention_mix or []
@@ -254,9 +234,13 @@ class _RenderMixin:
         elif geak_pending_status in GEAK_DROPPED_STATUSES:
             geak_pending_tag = f" ⚠ geak candidate dropped unvalidated ({geak_pending_status})"
         elif geak_revalidation_status in REBENCH_FAILED_STATUSES and not geak_in_stack:
-            # A fallback rebench that also failed is the same unjudged drop; only ``no_material`` / ``no_promote`` are
-            # verdicts and stay silent here.
-            geak_pending_tag = f" ⚠ geak candidate dropped unvalidated (rebench_{geak_revalidation_status})"
+            # A failed revalidation is the same unjudged drop; only ``no_material`` / ``no_promote`` are verdicts and
+            # stay silent here.
+            given_up = self.geak_result.get("revalidation_error_class") == REBENCH_UNMEASURED_GIVEN_UP
+            geak_pending_tag = (
+                f" ⚠ geak candidate dropped unvalidated (rebench_{geak_revalidation_status}"
+                f"{', given up unmeasured' if given_up else ''})"
+            )
         else:
             geak_pending_tag = ""
         from hyperloom.inference_optimizer import framework_registry
@@ -487,29 +471,6 @@ class _RenderMixin:
             )
         return "\n".join(out)
 
-    def to_proposal_scores_summary(self) -> str:
-        """Render advisory multi-model proposal scores for Orchestration; no mean/sorting, rater identities anonymized. Empty when no recent round carries scores."""
-        rounds = [
-            r
-            for r in (self.specialist_rounds or [])
-            if isinstance(r, dict)
-            and isinstance(r.get("ensemble_scores"), dict)
-            and (r["ensemble_scores"].get("models") or {})
-        ]
-        if not rounds:
-            return ""
-        shown = rounds[-_PROPOSAL_SCORE_ROUNDS:]
-        labels = proposal_scores.rater_labels(shown)
-        rows: list[str] = [
-            "(Advisory only — one reference among many, NOT a ranking "
-            "directive. Scores are 0-10 likelihood-of-throughput-gain "
-            "priors from independent anonymized raters; weigh on merit "
-            "alongside gaps / KB / analysis.md.)",
-        ]
-        for round_row in shown:
-            rows.extend(proposal_scores.round_rows(round_row, labels))
-        return "\n".join(rows)
-
     def to_prompt_summary(self) -> str:
         """Compact, human-readable snapshot for prompt injection."""
         from ...kernel import kernel_decisions
@@ -539,6 +500,14 @@ class _RenderMixin:
             f"last_profile_status={self.last_profile_status or '(none)'}",
             f"last_profile_args='{self.last_profile_args}'",
             f"last_trace_analyze={self._format_trace_analyze_blob(self.last_trace_analyze)}",
+            *(
+                [
+                    "last_trace_analyze_by_role(PD prefill/decode engines)="
+                    f"{variant_line.role_trace_text(self.last_trace_analyze_by_role)}"
+                ]
+                if self.last_trace_analyze_by_role
+                else []
+            ),
             f"profiler_digest={self._format_profiler_digest()}",
             # Full TraceLens analysis.md.
             f"analysis_md={self._format_analysis_md_pointer()}",

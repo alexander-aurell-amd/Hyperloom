@@ -12,18 +12,18 @@ import pytest
 import yaml
 
 from hyperloom.orchestrator.actions.executors.tests.test_native_launch_replay import native_receipt
-from hyperloom.orchestrator.actions.executors import _grid_runner as gr
-from hyperloom.orchestrator.actions.executors._grid_base import GridVariant
-from hyperloom.orchestrator.actions.executors._grid_runner import GridRecipe, _build_variant_yaml, run_grid
-from hyperloom.orchestrator.actions.executors._grid_variant_filter import ServingStack, apply_compatibility_filter
-from hyperloom.orchestrator.actions.executors._launch_evidence import persist_launch_evidence
-from hyperloom.orchestrator.actions.executors._workload_envs import (
+from hyperloom.orchestrator.actions.executors.grid import _grid_runner as gr
+from hyperloom.orchestrator.actions.executors.grid._grid_base import GridVariant
+from hyperloom.orchestrator.actions.executors.grid._grid_runner import GridRecipe, _build_variant_yaml, run_grid
+from hyperloom.orchestrator.actions.executors.grid._grid_variant_filter import ServingStack, apply_compatibility_filter
+from hyperloom.orchestrator.actions.executors.workload._launch_evidence import persist_launch_evidence
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import (
     BenchmarkTarget,
     LaunchLayer,
     materialize_benchmark_config,
 )
 from hyperloom.common.failure_signature import SERVE_FLAG
-from hyperloom.orchestrator.actions.executors._spec_decode_pin import (
+from hyperloom.orchestrator.actions.executors.framework_change._spec_decode_pin import (
     SpeculativeDecodingPinnedError,
     refuse_unpinned_speculative_change,
     speculative_pin_reason,
@@ -255,6 +255,28 @@ def test_a_base_with_no_speculative_decoding_may_enable_it_with_a_simulated_acce
 ):
     """There is no acceptance on the base to compare against; the golden value is the agent's to look up."""
     refuse_unpinned_speculative_change(base_args, base_envs, candidate_args, candidate_envs)
+
+
+LLAMACPP_MTP = "-md /models/mtp-head.gguf --spec-type draft-mtp --spec-draft-n-max 5"
+
+
+_LLAMACPP_SYNTHETIC = LLAMACPP_MTP + " --spec-synth-len 4"
+
+
+@pytest.mark.parametrize(
+    ("base_args", "candidate_args", "candidate_envs"),
+    [
+        pytest.param(LLAMACPP_MTP, _LLAMACPP_SYNTHETIC, {}, id="a-draft-head"),
+        pytest.param("--spec-type draft-mtp", _LLAMACPP_SYNTHETIC, {}, id="a-draft-type"),
+        pytest.param("--spec-draft-model /models/d.gguf", _LLAMACPP_SYNTHETIC, {}, id="a-draft-model"),
+        pytest.param(LLAMACPP_MTP, LLAMACPP_MTP, {"LLAMA_ARG_SPEC_SYNTH_LEN": "4"}, id="declared-by-its-env"),
+    ],
+)
+def test_a_llama_server_candidate_may_not_declare_the_acceptance_of_a_draft_its_base_verifies(
+    base_args, candidate_args, candidate_envs
+):
+    with pytest.raises(SpeculativeDecodingPinnedError, match="verifies a real draft"):
+        refuse_unpinned_speculative_change(base_args, {}, candidate_args, candidate_envs)
 
 
 def test_the_refusal_names_what_changed():

@@ -18,22 +18,23 @@ import pytest
 from hyperloom.orchestrator.tests._helpers import patch_integrate_patch_roots
 
 from hyperloom.orchestrator.actions.executors import _accuracy_gate
-from hyperloom.orchestrator.actions.executors import _integrate_apply as integrate_apply
-from hyperloom.orchestrator.actions.executors import _patch_sources as patch_sources
+from hyperloom.orchestrator.actions.executors.integrate import _integrate_apply as integrate_apply
+from hyperloom.orchestrator.actions.executors.integrate import _integrate_resolve as integrate_resolve
+from hyperloom.orchestrator.actions.executors.patching import _patch_sources as patch_sources
 from hyperloom.orchestrator.actions.executors import _setup_replay
 from hyperloom.orchestrator.actions.executors import integrate_patch as ip
-from hyperloom.orchestrator.actions.executors import _patch_artifacts as patch_artifacts
-from hyperloom.orchestrator.actions.executors import _integrate_results as integrate_results
+from hyperloom.orchestrator.actions.executors.patching import _patch_artifacts as patch_artifacts
+from hyperloom.orchestrator.actions.executors.integrate import _integrate_results as integrate_results
 
 from hyperloom.orchestrator.tests._helpers import integrate_extra, variant_result
 from hyperloom.orchestrator.actions.executors.integrate_patch import IntegratePatchExecutor
-from hyperloom.orchestrator.actions.executors._workload_envs import (
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import (
     FrameworkScriptMismatchError,
 )
 from hyperloom.orchestrator.loop.sub_agent_runner import RunnerContext
 from hyperloom.orchestrator.state._shared_state.enablement_round import EnablementRound
 from hyperloom.orchestrator.state.task_registry import Task
-from hyperloom.orchestrator.actions.executors import _integrate_bench as integrate_bench
+from hyperloom.orchestrator.actions.executors.integrate import _integrate_bench as integrate_bench
 
 
 _VALID_PATCH = """\
@@ -180,6 +181,81 @@ async def test_forged_task_without_critic_verdict_is_rejected(tmp_path):
     assert res["status"] == "rejected_by_critic"
     # patch not applied: the source file is untouched.
     assert (repo / "src.py").read_text().endswith("return 1\n")
+
+
+@pytest.mark.asyncio
+async def test_covered_step_integrates_without_a_critic_verdict(tmp_path, monkeypatch):
+    """A step the Coordinator runs itself is never a registry row, so its bench decides, not a recorded verdict."""
+    session = tmp_path / "s"
+    session.mkdir()
+    repo = tmp_path / "fw"
+    _init_git_repo(repo)
+    _write_workspace(session, "spec")
+
+    class _SS:
+        phase = "KERNEL_AGENT"
+        enablement = EnablementRound()
+
+        def get_specialist_patch_verdict(self, tid):
+            return ""  # no verdict on record
+
+        def grid_session_deadline_sec(self, **_kwargs):
+            return None
+
+        def save(self, _path):
+            pass
+
+    monkeypatch.setattr(
+        IntegratePatchExecutor,
+        "_bench_patch",
+        _stub_bench({"output_throughput": 200.0, "status": "succeeded"}, {"accuracy_pass": None}),
+    )
+    res = await IntegratePatchExecutor(session_dir=session)(
+        _make_ctx(
+            "t",
+            {"specialist_task_id": "spec", "framework_source_root": str(repo), "base_tput": 100.0},
+            extra={"shared_state": _SS(), "covered_step": True},
+        )
+    )
+
+    assert res["status"] == "kept"
+    assert (repo / "src.py").read_text().endswith("return 2\n")
+
+
+@pytest.mark.asyncio
+async def test_covered_step_on_the_upstream_pr_lane_still_needs_a_critic_verdict(tmp_path, monkeypatch):
+    """The upstream-PR lane fetches a remote diff into the live tree, so running as a covered step does not admit it."""
+    session = tmp_path / "s"
+    session.mkdir()
+    repo = tmp_path / "fw"
+    _init_git_repo(repo)
+
+    class _SS:
+        phase = "FRAMEWORK_AGENT"
+        enablement = EnablementRound()
+
+        def get_specialist_patch_verdict(self, tid):
+            return ""  # no verdict on record
+
+    def fetch(**_kwargs):
+        raise AssertionError("an unreviewed candidate must not be fetched")
+
+    monkeypatch.setattr(integrate_resolve, "materialize_candidate_patches", fetch)
+    res = await IntegratePatchExecutor(session_dir=session)(
+        _make_ctx(
+            "t",
+            {
+                "patch_source": "upstream_pr",
+                "candidate": {"repo": "vllm-project/vllm", "pr_number": 1015},
+                "framework_agent_candidate_id": "vllm-project/vllm#1015",
+                "framework_source_root": str(repo),
+            },
+            extra={"shared_state": _SS(), "covered_step": True},
+        )
+    )
+
+    assert res["status"] == "rejected_by_critic"
+    assert "no Critic verdict on record" in res["reason"]
 
 
 @pytest.mark.asyncio
@@ -331,7 +407,7 @@ async def test_bench_patch_forwards_the_session_and_phase_budgets_to_the_grid(tm
     config_path.write_text("benchmark: {}\n", encoding="utf-8")
 
     from hyperloom.common.deadline import Deadline
-    from hyperloom.orchestrator.actions.executors import _integrate_results as integrate_results
+    from hyperloom.orchestrator.actions.executors.integrate import _integrate_results as integrate_results
 
     captured: dict[str, Any] = {}
     phase = Deadline.after(900.0)
@@ -714,7 +790,7 @@ async def test_a_later_patch_failing_to_prepare_still_reverts_the_earlier_one(tm
     over that uncommitted tail left the first patch in the framework tree and
     graded an untouched-but-for-that tree as an environment fault.
     """
-    from hyperloom.orchestrator.actions.executors import _nogit_patch
+    from hyperloom.orchestrator.actions.executors.patching import _nogit_patch
 
     session = tmp_path / "s"
     session.mkdir()
@@ -745,7 +821,7 @@ async def test_a_later_patch_failing_to_prepare_still_reverts_the_earlier_one(tm
 @pytest.mark.asyncio
 async def test_a_crash_while_preparing_a_later_patch_still_reverts_the_earlier_one(tmp_path, monkeypatch):
     """The same tail, reached by losing the process rather than by returning."""
-    from hyperloom.orchestrator.actions.executors import _nogit_patch
+    from hyperloom.orchestrator.actions.executors.patching import _nogit_patch
 
     session = tmp_path / "s"
     session.mkdir()
@@ -882,7 +958,6 @@ async def test_a_runtime_only_round_is_benched_and_its_verdict_decides_the_runti
     """The acquired runtime is the round's whole change; the gate, not the apply stage, decides its fate."""
     from types import SimpleNamespace
     from hyperloom.agents.framework import isolation
-    from hyperloom.common.failure_signature import classify_failure
     from hyperloom.orchestrator.enablement.runtime import adapters
     from hyperloom.orchestrator.enablement.runtime.stack_actions import (
         EnablementStackAction,
@@ -904,7 +979,6 @@ async def test_a_runtime_only_round_is_benched_and_its_verdict_decides_the_runti
         "get_adapter",
         lambda _fw: SimpleNamespace(
             build_stack_action=lambda _request: EnablementStackAction(
-                kind="runtime_candidate",
                 framework="vllm",
                 gap_id="gap.enablement.missing_model_arch",
                 capability="missing_model_arch",
@@ -927,9 +1001,6 @@ async def test_a_runtime_only_round_is_benched_and_its_verdict_decides_the_runti
             {
                 "specialist_task_id": "spec",
                 "enablement": True,
-                "enablement_failure_signature": classify_failure(
-                    "ValueError: Model architectures ['DeepseekV4ForCausalLM'] are not supported for now."
-                ).to_dict(),
             },
         )
     )
@@ -1049,7 +1120,7 @@ async def test_apply_only_restores_user_stash_but_resume_refuses_unproven_user_m
 
 @pytest.mark.asyncio
 async def test_cancel_mid_non_git_apply_restores_prepared_ledger_without_returned_records(tmp_path, monkeypatch):
-    from hyperloom.orchestrator.actions.executors import _nogit_patch
+    from hyperloom.orchestrator.actions.executors.patching import _nogit_patch
 
     session = tmp_path / "session"
     repo = tmp_path / "fw"

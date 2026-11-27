@@ -13,7 +13,7 @@ import yaml
 from hyperloom.inference_optimizer.session.paths import asset_root
 from hyperloom.orchestrator.actions.executors import PatchedServer, _server_patcher
 from hyperloom.orchestrator.actions.executors._profile_setup import prepare_profile, speculative_tokens_per_step
-from hyperloom.orchestrator.actions.executors._workload_envs import LaunchLayer, materialize_config_with_envs
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import LaunchLayer, materialize_config_with_envs
 from hyperloom.orchestrator.actions.executors.agentx_point import apply_native_runtime, enable_profile
 
 
@@ -103,7 +103,6 @@ def test_native_and_fixed_profiles_share_patches_not_launch_controls(tmp_path, m
     assert (
         not {
             "SGLANG_PROFILE_WITH_STACK",
-            "SGLANG_PROFILE_RECORD_SHAPE",
             "SGLANG_PROFILE_RECORD_SHAPES",
             "SGLANG_GRAPH_BATCH_CAPTURE",
         }

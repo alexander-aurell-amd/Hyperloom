@@ -21,13 +21,15 @@ from __future__ import annotations
 import hashlib
 import re
 from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Any
 
+from hyperloom_common.gpu_card import GpuCard
 from hyperloom.common.benchmark_config import BenchmarkPoint, BenchmarkPointError
 from hyperloom.common.launch_credentials import credentials_in_the_clear
 from hyperloom.contracts.measurement import Purpose
 from hyperloom.measure.checkpoint import CheckpointPlan
+from hyperloom.measure.jit.native.needs import BUILT_ROOT_KINDS, EXECUTABLE_ROOT, PACKAGE_ROOT, RUNTIME_ROOT
 from hyperloom.measure.long_context.plan import LongContextPlan
 from hyperloom.measure.short_prompts.plan import ShortPromptPlan
 from hyperloom.measure.surface import POINT_ENV_KEYS, REQUEST_ENV_KEYS
@@ -61,6 +63,8 @@ _ACCURACY = "accuracy"
 _SHORT_PROMPTS = "short_prompts"
 _LONG_CONTEXT = "long_context"
 _CHECKPOINT = "checkpoint"
+_BOOT_BUDGET = "boot_budget_sec"
+_CARD = "card"
 _RESULT_DIR = "result_dir"
 KINDS = ("test", "profile", _ACCURACY, "repro")
 PURPOSES = tuple(purpose.value for purpose in Purpose)
@@ -138,12 +142,33 @@ class Meta:
         }
 
 
+def _card(value: Any, path: str) -> GpuCard | None:
+    """The card the session read; ``None`` when it read none."""
+    if value is None:
+        return None
+    r = Reader(value, path)
+    card = GpuCard(
+        name=r.string("name"),
+        device_id=r.string("device_id"),
+        gfx=r.text("gfx") or "",
+        compute_units=r.integer("compute_units", minimum=1, optional=True),
+        memory_mib=r.integer("memory_mib", minimum=1) or 1,
+        memory_bandwidth_gbps=r.number("memory_bandwidth_gbps", minimum=0, optional=True),
+        engine_clock_mhz=r.integer("engine_clock_mhz", minimum=1, optional=True),
+    )
+    r.done()
+    return card
+
+
 @dataclass(frozen=True)
 class Hardware:
+    """The cards a test needs: ``gpu_type`` is the session's label, ``card`` what its cards reported."""
+
     gpu_type: str
     gpu_count: int
     power_cap_w: float | None
     partition_mode: str | None
+    card: GpuCard | None
 
     @classmethod
     def parse(cls, value: Any, path: str) -> "Hardware":
@@ -153,6 +178,7 @@ class Hardware:
             gpu_count=r.integer("gpu_count", minimum=1) or 1,
             power_cap_w=r.number("power_cap_w", minimum=0, optional=True),
             partition_mode=r.text("partition_mode", optional=True),
+            card=_card(r.optional(_CARD), r.at(_CARD)),
         )
         r.done()
         return hardware
@@ -163,6 +189,7 @@ class Hardware:
             "gpu_count": self.gpu_count,
             "power_cap_w": self.power_cap_w,
             "partition_mode": self.partition_mode,
+            _CARD: None if self.card is None else asdict(self.card),
         }
 
 
@@ -324,7 +351,7 @@ class EnvRoot:
         dist.done()
         root = cls(
             id=r.text("id", pattern=_ID_RE) or "",
-            kind=r.choice(_KIND, ("package", _RUNTIME)) or "",
+            kind=r.choice(_KIND, (PACKAGE_ROOT, RUNTIME_ROOT, EXECUTABLE_ROOT)) or "",
             import_name=r.text("import_name") or "",
             dist_name=dist_name,
             dist_version=dist_version,
@@ -334,6 +361,8 @@ class EnvRoot:
         paths = [entry.path for entry in root.entries]
         if len(set(paths)) != len(paths):
             raise DocumentError(f"{path}.entries: a path appears twice")
+        if root.kind == EXECUTABLE_ROOT and root.entries:
+            raise DocumentError(f"{path}.entries: an executable root lays no file over a package")
         return root
 
     def to_document(self) -> dict[str, Any]:
@@ -390,9 +419,9 @@ class BuildRef:
 
 @dataclass(frozen=True)
 class Environment:
-    """The overlay a runner rebuilds. ``builds`` name the ready native build of each ``runtime`` root, one each, and of
-    a package root whose JIT modules a CPU build made (aiter's); a sheet with none leaves the key out, so a
-    runner that does not know it reads every other sheet as before and refuses one that has builds."""
+    """The overlay a runner rebuilds. ``builds`` name the ready native build of each ``runtime`` and ``executable`` root,
+    one each, and of a package root whose JIT modules a CPU build made (aiter's); a sheet with none leaves the key out,
+    so a runner that does not know it reads every other sheet as before and refuses one that has builds."""
 
     roots: tuple[EnvRoot, ...] = ()
     runtime: RuntimeSnapshot | None = None
@@ -417,12 +446,12 @@ class Environment:
         if len(set(ids)) != len(ids):
             raise DocumentError(f"{path}.roots: an id appears twice")
         kinds = {root.id: root.kind for root in environment.roots}
-        runtime_ids = sorted(root_id for root_id, kind in kinds.items() if kind == _RUNTIME)
+        built_ids = sorted(root_id for root_id, kind in kinds.items() if kind in BUILT_ROOT_KINDS)
         built = [ref.root_id for ref in environment.builds]
-        if len(set(built)) != len(built) or not set(runtime_ids) <= set(built) <= set(kinds):
+        if len(set(built)) != len(built) or not set(built_ids) <= set(built) <= set(kinds):
             raise DocumentError(
-                f"{path}.builds: each runtime root needs exactly one build, a package root may have one (of the "
-                f"modules its JIT builds), and each build names a root (runtime roots {runtime_ids}, builds {built})"
+                f"{path}.builds: each runtime or executable root needs exactly one build, a package root may have one "
+                f"(of the modules its JIT builds), and each build names a root (built roots {built_ids}, builds {built})"
             )
         return environment
 
@@ -486,6 +515,9 @@ class Procedure:
     short_prompts: ShortPromptPlan | None = None
     long_context: LongContextPlan | None = None
     checkpoint: CheckpointPlan | None = None
+    #: How long, at least, each round's server may take to be ready (``TestCall.boot_budget_sec``); ``None``: the default
+    #: share.
+    boot_budget_sec: float | None = None
 
     @classmethod
     def parse(cls, value: Any, path: str) -> "Procedure":
@@ -505,6 +537,7 @@ class Procedure:
             short_prompts=_short_prompts(r.optional(_SHORT_PROMPTS), r.at(_SHORT_PROMPTS)),
             long_context=_long_context(r.optional(_LONG_CONTEXT), r.at(_LONG_CONTEXT)),
             checkpoint=_checkpoint(r.optional(_CHECKPOINT), r.at(_CHECKPOINT)),
+            boot_budget_sec=r.number(_BOOT_BUDGET, minimum=1, optional=True),
         )
         r.done()
         return procedure
@@ -526,6 +559,8 @@ class Procedure:
             document[_LONG_CONTEXT] = self.long_context.to_document()
         if self.checkpoint is not None:
             document[_CHECKPOINT] = self.checkpoint.to_document()
+        if self.boot_budget_sec is not None:
+            document[_BOOT_BUDGET] = self.boot_budget_sec
         return document
 
 

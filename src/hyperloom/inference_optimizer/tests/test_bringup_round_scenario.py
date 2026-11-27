@@ -31,10 +31,6 @@ from hyperloom.orchestrator.state.round_store import (
 )
 from hyperloom.orchestrator.state.task_registry import TaskRegistry
 
-#: The round: two blockers peeled one per attempt, then a boot that serves.
-#: Written as a stack rather than three logs because what is under test is that
-#: the round keeps going, not the wording of any one failure.
-
 
 def _ctx(task_id: str) -> RunnerContext:
     from hyperloom.orchestrator.state.task_registry import Task
@@ -119,7 +115,6 @@ def _lane(session: Path, tasks: TaskRegistry, rounds: RoundStore, launch_log: st
         _derive_checkpoint_weight_facts=lambda _log: "",
         framework_authoring_lanes_ttl=lambda _params, *, base_ttl_sec: (["research_lane"], base_ttl_sec),
         time_budget_denial_for_action=lambda _action: None,
-        _enqueue_on_validated_board=_noop,
         # Attributes exposed by CoordinatorCollaborator properties; set directly
         # on the shim since property descriptors don't apply to SimpleNamespace.
         knowledge_plane=None,
@@ -127,13 +122,14 @@ def _lane(session: Path, tasks: TaskRegistry, rounds: RoundStore, launch_log: st
     )
     for owner, name in (
         (EnablementParams, "build_enablement_specialist_params"),
-        (EnablementParams, "_discover_enablement_candidate_refs"),
         (EnablementLane, "_maybe_record_enablement_human_review"),
         (EnablementLane, "maybe_rearm_enablement"),
         (EnablementLane, "_maybe_enqueue_enablement_specialist"),
         (EnablementLane, "enablement_admitted"),
+        (EnablementLane, "_reached_terminal"),
         (EnablementLane, "_check_argv_terminal"),
         (EnablementLane, "_check_environment_terminal"),
+        (EnablementLane, "_check_source_change_terminal"),
         (EnablementLane, "_environment_verdict"),
         (EnablementLane, "enablement_in_flight"),
         (EnablementLane, "_round_has_live_work"),
@@ -143,6 +139,7 @@ def _lane(session: Path, tasks: TaskRegistry, rounds: RoundStore, launch_log: st
         (EnablementLane, "close_lane_event"),
         (EnablementBuild, "maybe_enqueue_specialist_requested_build"),
         (EnablementBuild, "maybe_escalate_to_targeted_build"),
+        (EnablementBuild, "_targeted_builds_off"),
     ):
         setattr(shim, name, types.MethodType(getattr(owner, name), shim))
     # Collaborator access goes through self._coord, so route it back to the shim.
@@ -152,17 +149,9 @@ def _lane(session: Path, tasks: TaskRegistry, rounds: RoundStore, launch_log: st
         enablement_build=shim,
         specialist_dispatch=shim,
         gpu_lanes=shim,
+        build_lifecycle=types.SimpleNamespace(enqueue_targeted_build=_noop),
     )
     return shim
-
-
-#: A round that never gets anywhere: the same wall, attempt after attempt, and
-#: no clean boot at the end. Written as explicit attempts rather than a blocker
-#: stack because the point is that nothing is peeled.
-
-#: The same wall, alternating between one the launcher rejected on its own
-#: arguments and one the engine hit after doing real work. Each class has its
-#: own terminal, and neither sequence on its own reaches three of a kind.
 
 
 async def _seed_failed_rounds(rounds: RoundStore, n: int) -> None:
@@ -185,12 +174,9 @@ async def test_the_enablement_attempt_cap_stops_a_round_that_keeps_asking(
     monkeypatch,
 ):
     """Consecutive rounds that repair nothing exhaust the cap and stop the run."""
-    import hyperloom.agents.framework.sources as sources
-
     from hyperloom.orchestrator.actions.executors import _multi_node_env as multi_node
     from hyperloom.orchestrator.phases.machine_state import ENABLEMENT_MAX_ATTEMPTS as _ENABLEMENT_MAX_ATTEMPTS
 
-    monkeypatch.setattr(sources, "enumerate_candidates", lambda _request: [])
     monkeypatch.setattr(multi_node, "is_multi_node", lambda: False)
 
     session, _slot = round_slot
@@ -214,18 +200,90 @@ async def test_the_enablement_attempt_cap_stops_a_round_that_keeps_asking(
 
 
 @pytest.mark.asyncio
+async def test_a_round_whose_fix_no_source_changes_refuses_stops_the_run(round_slot, registry, monkeypatch):
+    """The first round that delivers a source change ends the lane: the rounds after it would be refused too."""
+    from hyperloom.inference_optimizer.breakdown.stop_reasons import SOURCE_CHANGE_REFUSED_STOP_REASON
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as multi_node
+
+    monkeypatch.setattr(multi_node, "is_multi_node", lambda: False)
+
+    session, _slot = round_slot
+    tasks, rounds, _locks = registry
+    lane = _lane(session, tasks, rounds, boot_log_for(LadderStage.ENGINE_INIT))
+    specialist = await lane._maybe_enqueue_enablement_specialist()
+    assert specialist
+
+    await lane.maybe_rearm_enablement(
+        {
+            "enablement": True,
+            "status": "skipped",
+            "skipped_reason": "no_source_changes",
+            "source_changes": ["1 patch(es)"],
+            "specialist_task_id": specialist,
+        }
+    )
+    assert await rounds.held() is None
+
+    assert await lane._maybe_enqueue_enablement_specialist() == ""
+    assert lane.shared_state.stop_reason == SOURCE_CHANGE_REFUSED_STOP_REASON
+    assert await rounds.consecutive_stalled() == 1
+
+
+def test_only_the_last_rounds_refused_source_change_is_held_against_the_lane():
+    """A round that settles without one clears it, so a stall for another reason leaves the lane running."""
+    lane_state = EnablementRound()
+    lane_state.record_round_defects({"status": "skipped", "source_changes": ["1 patch(es)"]})
+    assert lane_state.last_refused_source_changes == ["1 patch(es)"]
+
+    lane_state.record_round_defects({"status": "reverted"})
+    assert lane_state.last_refused_source_changes == []
+
+
+@pytest.mark.parametrize(("status", "held"), [("reverted", True), ("kept", False), ("advanced", False)])
+def test_a_refused_build_request_outlives_its_rounds_configuration_unless_that_bought_ground(status, held):
+    """A round may deliver configuration beside a build request: the request stands until the configuration works."""
+    lane_state = EnablementRound()
+    lane_state.note_refused_build_request()
+
+    lane_state.record_round_defects({"status": status})
+
+    assert lane_state.last_refused_source_changes == (["a targeted build"] if held else [])
+
+
+@pytest.mark.asyncio
+async def test_a_round_whose_configuration_fails_beside_a_refused_build_request_stops_the_run(
+    round_slot, registry, monkeypatch
+):
+    """The configuration is tried first; when it buys nothing, what is left is a build the flag refuses."""
+    from hyperloom.inference_optimizer.breakdown.stop_reasons import SOURCE_CHANGE_REFUSED_STOP_REASON
+    from hyperloom.orchestrator.actions.executors import _multi_node_env as multi_node
+
+    monkeypatch.setattr(multi_node, "is_multi_node", lambda: False)
+
+    session, _slot = round_slot
+    tasks, rounds, _locks = registry
+    lane = _lane(session, tasks, rounds, boot_log_for(LadderStage.ENGINE_INIT))
+    specialist = await lane._maybe_enqueue_enablement_specialist()
+    assert specialist
+    lane.shared_state.enablement.note_refused_build_request()
+
+    await lane.maybe_rearm_enablement({"enablement": True, "status": "reverted", "specialist_task_id": specialist})
+    assert await rounds.held() is None
+
+    assert await lane._maybe_enqueue_enablement_specialist() == ""
+    assert lane.shared_state.stop_reason == SOURCE_CHANGE_REFUSED_STOP_REASON
+
+
+@pytest.mark.asyncio
 async def test_an_advancing_round_does_not_exhaust_the_cap(
     round_slot,
     registry,
     monkeypatch,
 ):
     """An advancing round resets the streak so a bring-up outlives the cap."""
-    import hyperloom.agents.framework.sources as sources
-
     from hyperloom.orchestrator.actions.executors import _multi_node_env as multi_node
     from hyperloom.orchestrator.phases.machine_state import ENABLEMENT_MAX_ATTEMPTS as _ENABLEMENT_MAX_ATTEMPTS
 
-    monkeypatch.setattr(sources, "enumerate_candidates", lambda _request: [])
     monkeypatch.setattr(multi_node, "is_multi_node", lambda: False)
 
     session, _slot = round_slot
@@ -259,11 +317,8 @@ async def test_a_round_settles_when_the_caller_has_no_reason_to_give(
     monkeypatch,
 ):
     """Most settles carry a reason and some carry none; both end the round."""
-    import hyperloom.agents.framework.sources as sources
-
     from hyperloom.orchestrator.actions.executors import _multi_node_env as multi_node
 
-    monkeypatch.setattr(sources, "enumerate_candidates", lambda _request: [])
     monkeypatch.setattr(multi_node, "is_multi_node", lambda: False)
 
     session, _slot = round_slot

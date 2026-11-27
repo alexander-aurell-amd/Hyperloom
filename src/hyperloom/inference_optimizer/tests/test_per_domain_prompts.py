@@ -12,7 +12,6 @@ from hyperloom.orchestrator.specialists.domains import (
     SPECIALIST_DOMAINS,
     get_domain,
 )
-from hyperloom.orchestrator.prompts.specialist_focus import _DOMAIN_FOCUS_TEMPLATES
 from hyperloom.orchestrator.specialists.prompt_inputs import SpecialistPromptInputs
 from hyperloom.orchestrator.prompts.specialist_prompt_builder import build_specialist_prompts
 
@@ -37,12 +36,6 @@ def _build(domain_key: str) -> str:
     )
     system, user = build_specialist_prompts(inp)
     return system + "\n" + user
-
-
-# 1. Coverage — every catalogue domain has a focus template
-def test_every_domain_has_focus_template():
-    for domain in SPECIALIST_DOMAINS:
-        assert domain.key in _DOMAIN_FOCUS_TEMPLATES, f"missing per-domain template for {domain.key!r}"
 
 
 # 2. Per-domain output contracts — the keys each consumer parses back
@@ -148,7 +141,7 @@ def test_enablement_book_lives_in_user_not_system_prompt():
 
 
 def test_enablement_mandate_carries_the_dispatch_evidence():
-    """Source context and ranked refs discovered by the Coordinator reach the mandate."""
+    """The source context read by the Coordinator reaches the mandate."""
     domain = get_domain("enablement_specialist")
     assert domain is not None
     weights = "CHECKPOINT WEIGHTS: model.layers.0.mlp.gate_up_proj.weight [8192, 4096]"
@@ -161,15 +154,30 @@ def test_enablement_mandate_carries_the_dispatch_evidence():
         gap_evidence={"model": "Qwen/Qwen3-8B"},
         framework="vllm",
         enablement_source_context=weights,
-        enablement_candidate_refs=("ROCm/vllm#123", "vllm-project/vllm#456"),
         enablement_failure_signature=_DISPATCHED,
     )
     _system, user = build_specialist_prompts(inp)
     assert "SOURCE CONTEXT" in user
     assert weights in user
-    assert "CANDIDATE BRIDGING" in user
-    assert "ROCm/vllm#123" in user
-    assert "vllm-project/vllm#456" in user
+
+
+@pytest.mark.parametrize("no_source_changes", [True, False])
+def test_the_enablement_playbook_says_which_rung_is_kept_exactly_under_no_source_changes(no_source_changes):
+    """The specialist is told that a fix above Rung 1 is refused and ends the run, so it looks for configuration first."""
+    domain = get_domain("enablement_specialist")
+    inp = SpecialistPromptInputs(
+        domain=domain,
+        max_turns=4,
+        gap_canonical_id="gap.enablement.example",
+        gap_symptom="example symptom",
+        gap_layer=domain.layer,
+        framework="vllm",
+        enablement_failure_signature=_DISPATCHED,
+        no_source_changes=no_source_changes,
+    )
+    _system, user = build_specialist_prompts(inp)
+    assert ("### Launch configuration only (`--no-source-changes`)" in user) is no_source_changes
+    assert ("enablement_blocked_by_no_source_changes" in user) is no_source_changes
 
 
 def test_enablement_mandate_renders_the_dispatched_signature():
@@ -407,20 +415,21 @@ def test_R2_unknown_domain_allowed(gate):
     )
 
 
-def test_R2_missing_gap_denied(gate):
+def test_R2_missing_gap_denied_and_params_left_untouched():
+    state = SharedState()
+    state.upsert_gap(
+        {"canonical_id": "gap.framework.scheduler", "domain_hint": "serving_specialist", "severity": "high"}
+    )
+    gate = PolicyGate(role_registry=default_role_registry(), shared_state=state)
+    params = {"domain": "serving_specialist"}
     with pytest.raises(PolicyDenied) as exc:
         gate.validate_intent(
             "orchestration",
-            Intent(
-                type=IntentType.DELEGATE,
-                payload={
-                    "action_name": "specialist",
-                    "params": {"domain": "serving_specialist"},
-                },
-            ),
+            Intent(type=IntentType.DELEGATE, payload={"action_name": "specialist", "params": params}),
         )
     assert exc.value.rule == "specialist_dispatch_source"
     assert "gap" in str(exc.value)
+    assert params == {"domain": "serving_specialist"}
 
 
 def test_R2_max_turns_excess_denied(gate):
@@ -600,74 +609,6 @@ async def test_specialist_runner_unknown_domain_synthesises_empty(tmp_path):
 
 
 # 8. SharedState specialist round bookkeeping
-def test_domain_round_counters_tick_all_anchors():
-    from hyperloom.orchestrator.specialists.domains import (
-        KNOWLEDGE_DOMAIN_TAGS,
-    )
-
-    s = SharedState()
-    s.bump_domain_round_counters()
-    s.bump_domain_round_counters()
-    for anchor in KNOWLEDGE_DOMAIN_TAGS:
-        assert s.rounds_since_last_specialist[anchor] == 2
-        assert s.rounds_since_last_keep[anchor] == 2
-
-
-def test_note_specialist_dispatched_resets_only_its_anchor():
-    s = SharedState()
-    s.bump_domain_round_counters()
-    s.bump_domain_round_counters()
-    # serving_specialist maps to the "framework" kb_anchor.
-    s.note_specialist_dispatched("serving_specialist")
-    assert s.rounds_since_last_specialist["framework"] == 0
-    # A different anchor is untouched.
-    assert s.rounds_since_last_specialist["kernel_agent"] == 2
-    # keep counter is independent of the dispatch reset.
-    assert s.rounds_since_last_keep["framework"] == 2
-
-
-def test_note_domain_keep_resets_keep_counter_by_anchor():
-    s = SharedState()
-    s.bump_domain_round_counters()
-    s.note_domain_keep("framework")
-    assert s.rounds_since_last_keep["framework"] == 0
-    assert s.rounds_since_last_specialist["framework"] == 1
-
-
-def test_best_gap_for_anchor_picks_high_severity_least_attempted():
-    s = SharedState()
-    s.upsert_gap({"canonical_id": "gap.a", "domain_hint": "serving_specialist", "severity": "medium"})
-    s.upsert_gap({"canonical_id": "gap.b", "domain_hint": "framework", "severity": "high"})
-    # framework is serving_specialist's anchor -> both resolve to "framework".
-    assert s.best_gap_for_anchor("framework") == "gap.b"
-    assert s.best_gap_for_anchor("serving_specialist") == "gap.b"
-    # An anchor with no matching gap returns "".
-    assert s.best_gap_for_anchor("communication") == ""
-
-
-def test_stalled_domains_reports_over_threshold_widest_first():
-    s = SharedState()
-    for _ in range(5):
-        s.bump_domain_round_counters()
-    # framework recently dispatched -> below specialist threshold.
-    s.note_specialist_dispatched("framework")
-    s.note_domain_keep("framework")
-    stalled = s.stalled_domains(specialist_threshold=3, keep_threshold=3)
-    assert "framework" not in stalled
-    assert "kernel_agent" in stalled  # never dispatched/kept -> at 5
-    # Ordering: widest gap first, ties broken by anchor name.
-    assert stalled == sorted(
-        stalled,
-        key=lambda a: (
-            -max(
-                s.rounds_since_last_specialist.get(a, 0),
-                s.rounds_since_last_keep.get(a, 0),
-            ),
-            a,
-        ),
-    )
-
-
 def test_record_specialist_round_dedup_by_round_id():
     s = SharedState()
     s.record_specialist_round(
@@ -861,3 +802,22 @@ def test_enablement_ladder_rendered_exactly_once():
     _, user = build_specialist_prompts(inp)
     count = user.count("ENABLEMENT METHODOLOGY")
     assert count == 1, f"Expected 'ENABLEMENT METHODOLOGY' exactly once, found {count}"
+
+
+@pytest.mark.parametrize("no_source_changes", [True, False])
+def test_a_patch_mode_mandate_says_only_configuration_is_kept_exactly_under_no_source_changes(no_source_changes):
+    """A benching or enablement specialist still runs in patch mode under the flag; it is told what will be kept."""
+    domain = get_domain("serving_specialist")
+    inp = SpecialistPromptInputs(
+        domain=domain,
+        max_turns=4,
+        gap_canonical_id="gap.serving.example",
+        gap_symptom="example symptom",
+        framework="vllm",
+        workspace_path="/tmp/test/serving",
+        no_source_changes=no_source_changes,
+    )
+    system, user = build_specialist_prompts(inp)
+    text = system + "\n" + user
+    assert ("deliver configuration proposals" in text) is no_source_changes
+    assert ("Altitude — where the durable wins are" in text) is not no_source_changes

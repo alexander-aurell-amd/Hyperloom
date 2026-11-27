@@ -23,6 +23,7 @@ from typing import Any
 from hyperloom_common.coerce import first_text
 from hyperloom.common.prompt_safety import defang_prompt_structure
 from hyperloom.inference_optimizer.framework_registry import python_package
+from .native_server_blocks import carries_timing_lines, native_server_blocks
 from .roofline_evidence_section import roofline_evidence_section
 from .proposal_schemas import (
     EXPLORE_VARIANT_CONTRACT,
@@ -33,6 +34,8 @@ from .proposal_schemas import (
 from .specialist_focus import _DOMAIN_FOCUS_TEMPLATES
 from .specialist_prompt_text import (
     IDENTITY_MANDATE_LINES,
+    ENABLEMENT_LAUNCH_CONFIG_ONLY_LINES,
+    KEPT_LAUNCH_CONFIG_ONLY_ROW,
     ORCHESTRATOR_CHANNEL_LINES,
     PATCH_FIELD_LINES,
     PROPOSAL_SET_RULES,
@@ -40,6 +43,7 @@ from .specialist_prompt_text import (
 from ..measurement.runtime_findings import CORRECTNESS_FIX_MAX_DROP_PCT, CORRECTNESS_FIX_RULES
 
 from ..specialists.domains import domain_for_tag
+from ..specialists.option_reviews import review_request
 from ..specialists.profile import MODE_PATCH
 from ..specialists.prompt_inputs import SpecialistPromptInputs
 from .specialist_context_sections import (
@@ -100,8 +104,8 @@ def _authors_patches(inp: SpecialistPromptInputs) -> bool:
     return inp.mode == MODE_PATCH
 
 
-#: Throughput domains whose focus block offers flags first, so the coda has
-#: something to raise the sights from. ``enablement_specialist`` is absent
+#: Throughput domains that can answer a gap with a flag or with source, so the
+#: coda raises the sights from the former. ``enablement_specialist`` is absent
 #: because its ladder book says climb only as far as runnability needs;
 #: ``framework_rewrite_specialist`` because it authors source rewrites and
 #: nothing else, and already carries its own "Where the wins are" taxonomy;
@@ -119,13 +123,13 @@ _THROUGHPUT_AUTHORING_DOMAINS = frozenset(
 
 def _source_patch_altitude_block(inp: SpecialistPromptInputs) -> list[str]:
     """Where the durable wins are, for a throughput dispatch that may author code."""
-    if not (_authors_patches(inp) and inp.domain.key in _THROUGHPUT_AUTHORING_DOMAINS):
+    if not (_authors_patches(inp) and inp.domain.key in _THROUGHPUT_AUTHORING_DOMAINS) or inp.no_source_changes:
         return []
     return [
         "",
         "### Altitude — where the durable wins are",
         "",
-        "The flags above are cheap to validate and their ceiling is fixed by",
+        "Flags and env vars are cheap to validate and their ceiling is fixed by",
         "whoever wired them up; a source change moves that ceiling and keeps",
         "paying in later rounds. When the cheap levers do not close the gap, stop",
         "permuting them and read the source for:",
@@ -218,6 +222,7 @@ def _section_identity(inp: SpecialistPromptInputs) -> list[str]:
     if inp.allocated_gpu_ids:
         body.extend(_gpu_autonomy_block(inp))
     body.extend(_cpu_selfcheck_block(inp))
+    body.extend(native_server_blocks(inp))
     if inp.auto_retry_reason.strip():
         body.extend(_auto_retry_note_block(inp))
     return body
@@ -361,7 +366,7 @@ def _cross_domain_block(inp: SpecialistPromptInputs) -> list[str]:
     """Cross-domain mandate appended when ``scope == 'domains'``. The
     single deliverable is still
     ONE ``specialist_done``; the difference is the patch may span every domain
-    in scope and the Critic will hold it to the cross-domain rules.
+    in scope.
 
     Args:
         inp: The specialist prompt inputs (reads ``extra_focus_tags`` /
@@ -388,9 +393,7 @@ def _cross_domain_block(inp: SpecialistPromptInputs) -> list[str]:
         "- show this is genuine cross-domain synthesis, not a concatenation of "
         + "two independent single-domain edits (that is an explore grid combo, "
         + "not a cross-domain patch).",
-        "Set ``scope='domains'`` on the proposal so the Critic attaches the "
-        + "cross-domain review rules. Never self-report numeric speedups — the "
-        + "Coordinator measures gain.",
+        "Never self-report numeric speedups — the Coordinator measures gain.",
     ]
 
 
@@ -417,6 +420,7 @@ def _section_mandate(inp: SpecialistPromptInputs) -> list[str]:
     ]
     if anchor:
         rows.append(f"- anchor: `{anchor}`")
+    rows.extend([KEPT_LAUNCH_CONFIG_ONLY_ROW] if inp.no_source_changes and _authors_patches(inp) else [])
     rows.extend(_mandate_run_status(inp))
 
     rows.extend(
@@ -701,6 +705,7 @@ def _section_output_protocol(inp: SpecialistPromptInputs) -> list[str]:
         "  emit source-backed ``{what, source, expected_impact, accuracy_risk,",
         "  domain_tags[]}`` records.",
         "- ``residual_questions`` carries to the next specialist round.",
+        *review_request(inp),
         "",
         (f"Hard cap: at most **{inp.max_turns}** LLM turns. Emit specialist_done before the cap."),
     ]
@@ -761,9 +766,9 @@ def _section_iron_rules(inp: SpecialistPromptInputs) -> list[str]:
         "4. You **MUST** finish within ``max_turns`` LLM turns and end with",
         "   exactly one ``specialist_done`` exit signal. Silence past the cap",
         "   synthesizes an empty done.",
-        f"5. Use ``{workspace}/`` for ALL writes. It and ``SESSION_DIR`` are the",
-        "   only directories the dispatcher hands you to write; the source trees",
-        "   are yours to read.",
+        f"5. Use ``{workspace}/`` for ALL writes. It and ``SESSION_DIR`` are the only directories the dispatcher",
+        "   hands you to write; the source trees are yours to read. Keep your own probe scripts, logs and any",
+        "   server you start under ``scratch/`` there: that folder is never part of what you deliver.",
         "6. On tool error or no useful action left, emit",
         "   ``specialist_done{proposal_set=[], summary='<why>'}``.",
         f"7. {BASH_KILL_SAFETY_PREAMBLE}",
@@ -779,11 +784,9 @@ def _section_enablement_playbook(inp: SpecialistPromptInputs) -> list[str]:
     ``enablement_failure_signature``. Kept in the user prompt so the cached
     system prompt stays task-independent.
 
-    The dispatch's own evidence — source lines near the offending site (plus the
-    checkpoint weight inventory on a weight-init failure) and the ranked bridging
-    refs — is folded in from ``enablement_*`` inputs. Without them the mandate
-    renders its generic skeleton, so the agent is told to find a bridge while the
-    candidates already discovered for it are withheld.
+    The dispatch's own evidence — source lines near the offending site, plus the
+    checkpoint weight inventory on a weight-init failure — is folded in from
+    ``enablement_source_context``.
 
     Args:
         inp: Assembled prompt inputs for the current dispatch.
@@ -799,11 +802,11 @@ def _section_enablement_playbook(inp: SpecialistPromptInputs) -> list[str]:
         (inp.framework or "").strip().lower(),
         model or "(target model)",
         FailureSignature.from_dict(inp.enablement_failure_signature),
-        candidate_refs=inp.enablement_candidate_refs,
         source_context=inp.enablement_source_context,
     )
     rows = ["## 1b. ENABLEMENT PLAYBOOK", ""]
     rows.extend(mandate.splitlines())
+    rows.extend(ENABLEMENT_LAUNCH_CONFIG_ONLY_LINES if inp.no_source_changes else ())
     acc_cfg = inp.enablement_accepted_config or {}
     acc_envs = {str(k): str(v) for k, v in (acc_cfg.get("extra_envs") or {}).items()}
     acc_args = str(acc_cfg.get("extra_server_args") or "").strip()
@@ -921,9 +924,9 @@ def build_specialist_prompts(inp: SpecialistPromptInputs) -> tuple[str, str]:
             _section_execution_budget(inp),
             _section_gap(inp),
             _section_experience_kb(inp),
+            _section_runtime_findings(inp) if carries_timing_lines(inp) else [],
+            _section_source_hint(inp) if _authors_patches(inp) else [],
         ]
-        if _authors_patches(inp):
-            user_sections.append(_section_source_hint(inp))
     else:
         user_sections = [
             _section_mandate(inp),

@@ -12,7 +12,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
-from hyperloom.common.tracelens_report import fusion_findings
+from hyperloom.common.tracelens_report import fusion_findings, system_findings
 from hyperloom_common.coerce import to_int
 from hyperloom_common.timeutil import now_iso
 
@@ -44,6 +44,13 @@ _ROOFLINE_SIGNAL_KEYS: tuple[str, ...] = (
     "suggestion",
     "roofline_name",
 )
+
+
+def _tracelens_findings(analysis_md_path: str) -> dict[str, list[dict[str, Any]]]:
+    """TraceLens' fusion and system findings from the ``analysis.json`` beside ``analysis_md_path``; none without one."""
+    if not analysis_md_path:
+        return {"fusion_findings": [], "system_findings": []}
+    return {"fusion_findings": fusion_findings(analysis_md_path), "system_findings": system_findings(analysis_md_path)}
 
 
 def _saturation_delta(sat: dict[str, Any], prev_sat: dict[str, Any], key: str) -> float | None:
@@ -187,7 +194,7 @@ class _RooflineStateMixin:
             "trace_health_warnings": [dict(e) for e in warning_rows if isinstance(e, dict) and e.get("code")],
             "analysis_md_path": str(analysis_md_path),
             "analysis_md_text": analysis_md_text,
-            "fusion_findings": fusion_findings(analysis_md_path) if analysis_md_path else [],
+            **_tracelens_findings(analysis_md_path),
             "roofline_snapshot_id": to_int(recorded.get("roofline_snapshot_id"), 0) + 1,
             "roofline_baseline_gain_at_snapshot": float(self.cumulative_gain_validated),
             "ts": now_iso(),
@@ -360,8 +367,6 @@ class _RooflineStateMixin:
         self.bottleneck_shift = {
             "from": prev_sat.get("direction", ""),
             "to": sat.get("direction", ""),
-            "from_domain": (prev_sat.get("domain_hint") or {}).get("domain", ""),
-            "to_domain": domain_key,
             "prev_cycle": prev_cycle_snapshot.get("macro_cycle"),
             "cycle": latest_cycle,
             "within_delta": _saturation_delta(sat, prev_sat, "within_pct"),
@@ -372,3 +377,54 @@ class _RooflineStateMixin:
             "current": sat,
             "previous": prev_sat,
         }
+
+    def current_top_bottleneck(self) -> str:
+        """Return the latest roofline snapshot's ``top_bottleneck`` (\"\" when none)."""
+        snaps = self.roofline_snapshots if isinstance(self.roofline_snapshots, list) else []
+        if not snaps:
+            return ""
+        latest = snaps[-1]
+        if isinstance(latest, dict):
+            return str(latest.get("top_bottleneck") or "")
+        return ""
+
+    def current_within_roofline_pct(self) -> float | None:
+        """Return the latest snapshot's achieved share of its roofline ceiling."""
+        snaps = self.roofline_snapshots if isinstance(self.roofline_snapshots, list) else []
+        if not snaps:
+            return None
+        latest = snaps[-1]
+        if not isinstance(latest, dict):
+            return None
+        value = latest.get("within_roofline_pct")
+        if not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def mark_bottleneck_switch(self, prev_bottleneck: str = "") -> None:
+        """Flag that the next macro-cycle should redirect off ``prev_bottleneck`` (R3)."""
+        self.pending_bottleneck_switch = True
+        pb = (prev_bottleneck or "").strip() or self.current_top_bottleneck()
+        if pb:
+            self.last_cycle_bottleneck = pb
+
+    def clear_bottleneck_switch(self) -> None:
+        """Clear the pending bottleneck-switch handoff (R3)."""
+        self.pending_bottleneck_switch = False
+        self.last_cycle_bottleneck = ""
+
+    def maybe_clear_bottleneck_switch_on_drift(self, new_top_bottleneck: str) -> bool:
+        """Retire a pending switch once the live top bottleneck has drifted (R3)."""
+        if not bool(getattr(self, "pending_bottleneck_switch", False)):
+            return False
+        nt = (new_top_bottleneck or "").strip()
+        if nt and nt != (self.last_cycle_bottleneck or ""):
+            self.clear_bottleneck_switch()
+            return True
+        return False
+
+    @property
+    def roofline_snapshot_id(self) -> int:
+        """Counter of the newest roofline snapshot, or 0 before the first one."""
+        raw = (self.last_trace_analyze or {}).get("roofline_snapshot_id")
+        return int(raw) if isinstance(raw, int) else 0

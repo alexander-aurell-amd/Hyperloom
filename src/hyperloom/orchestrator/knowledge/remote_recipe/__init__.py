@@ -11,7 +11,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ._vendor.kb_store_client import KBStoreError, KnowledgeSections
+from hyperloom_common.kb_store import KBStoreError
+
 from .client import (
     RemoteRecipeClient,
     RemoteRecipeConfigurationError,
@@ -23,6 +24,7 @@ from .models import (
     RemoteRecipeValidationError,
     RemoteWriteResult,
 )
+from .sections import KnowledgeSections
 from .values import (
     CURRENT_KNOWLEDGE_SCHEMA_VERSION,
     RECORD_KIND_HYPERLOOM_RECIPE,
@@ -167,7 +169,6 @@ class RemoteWarmRecipeAdapter:
         self,
         *,
         label_match: dict[str, Any] | None = None,
-        hardware_in: list[str] | None = None,
         limit: int = 10,
     ) -> list[dict[str, Any]]:
         """Scan bounded candidate metadata while leaving ranking to T0."""
@@ -187,7 +188,6 @@ class RemoteWarmRecipeAdapter:
             result = self._client.search_identities(
                 scheme=self._scope.identity_scheme,
                 match=translated,
-                hardware_in=hardware_in,
                 offset=offset,
                 limit=page_size,
             )

@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from hyperloom_common import gpu_card
 
 from ..model_config_utils import summarize_model_config
 from ..session.manifest import load_manifest
@@ -39,6 +40,7 @@ from .session_setup import (
     _apply_operator_supplied_paths,
     _enforce_expected_framework,
     _persist_operator_supplied_paths,
+    read_session_card,
     _registered_framework_or_exit,
     _require_custom_entrypoint,
     _restore_operator_supplied_paths_from_state,
@@ -98,6 +100,13 @@ def _restore_budget_and_objective(args: Any, state: SharedState, manifest: Mappi
     return lines
 
 
+def _keep_launch_config_only(state) -> None:
+    """Record ``--no-source-changes`` on *state*: the flag, and the kernel phase and the warm replay it turns off."""
+    state.no_source_changes = True
+    state.kernel_enabled = False
+    state.warm_replay_enabled = False
+
+
 def _restore_phase_toggles(args: argparse.Namespace, state, session_dir: Path) -> None:
     """Honour the phase and gate decisions the original run persisted.
 
@@ -115,6 +124,13 @@ def _restore_phase_toggles(args: argparse.Namespace, state, session_dir: Path) -
     if not state.kernel_enabled:
         args.no_kernel = True
         print("  Kernel-agent          : DISABLED (persisted from original run)")
+    if state.no_source_changes:
+        args.no_source_changes = True
+        print("  source changes        : SKIPPED (persisted from original run)")
+    elif args.no_source_changes:
+        _keep_launch_config_only(state)
+        state.save(session_dir)
+        print("  source changes        : SKIPPED from this resume on, with the kernel phase and the warm replay off")
     # Same persistence contract for the FRAMEWORK_AGENT phase toggle.
     if not bool(getattr(state, "framework_agent_phase_enabled", True)):
         args.no_framework_agent = True
@@ -144,7 +160,7 @@ class _OperatorLaunchShape:
 
 
 def _reexport_session_identity(args: argparse.Namespace, state, session_dir: Path) -> None:
-    """Re-export the resumed session's model path, framework and GPU type."""
+    """Re-export the resumed session's model path, framework and GPU type, and publish the card it runs on."""
     if state.model_path:
         resume_model_path = str(state.model_path)
         os.environ["MODEL_PATH"] = resume_model_path
@@ -168,6 +184,9 @@ def _reexport_session_identity(args: argparse.Namespace, state, session_dir: Pat
     if state.gpu_type:
         os.environ["TARGET_GPU_TYPE"] = os.environ["GPU_TYPE"] = state.gpu_type
         print(f"  re-exported GPU_TYPE  : {state.gpu_type}")
+    # Read again rather than restored: the facts are the machine's this leg runs on.
+    nodes = max(int(getattr(args, "nodes", 1) or 1), int(getattr(state, "nodes", 1) or 1))
+    gpu_card.publish_session_card(read_session_card(nodes))
 
 
 def _reexport_session_environment(

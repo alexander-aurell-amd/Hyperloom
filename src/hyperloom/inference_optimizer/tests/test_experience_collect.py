@@ -30,7 +30,7 @@ from hyperloom.orchestrator.loop.coordinator import AdvisoryServices, Coordinato
 from hyperloom.orchestrator.phases.framework_records import _patch_material
 from hyperloom.orchestrator.phases.machine import Transition
 from hyperloom.orchestrator.roles.agent_role import default_role_registry
-from hyperloom.orchestrator.roles.mock_backend import MockBackend, MockTurn, ScriptedPlan
+from hyperloom.orchestrator.tests.mock_backend import MockBackend, MockTurn, ScriptedPlan
 from hyperloom_kb import (
     PACKAGED_DECLARATION,
     ExperienceHTTPService,
@@ -53,7 +53,7 @@ def session_dir(tmp_path: Path):
 
 
 def _tr(reason: str) -> Transition:
-    return Transition(from_phase="FRAMEWORK_AGENT", to_phase="SWEEP", reason=reason, evidence={})
+    return Transition(from_phase="FRAMEWORK_AGENT", to_phase="CYCLE_END", reason=reason, evidence={})
 
 
 def _coordinator(session_dir: Path) -> Coordinator:
@@ -479,7 +479,8 @@ def test_recorded_framework_attempts_satisfy_the_packaged_mapping(session_dir: P
 def test_an_auto_benched_specialist_proposal_publishes_its_reasoning_citations_and_read(session_dir: Path) -> None:
     import asyncio
 
-    from hyperloom.orchestrator.actions.executors.explore import _decision_fields, _grid_variants_from_payload
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import grid_variants_from_payload
+    from hyperloom.orchestrator.actions.executors.grid._explore_variants import decision_fields
 
     coord = _coordinator(session_dir)
     coord.shared_state.phase = "FRAMEWORK_AGENT"
@@ -502,7 +503,7 @@ def test_an_auto_benched_specialist_proposal_publishes_its_reasoning_citations_a
 
     asyncio.run(coord.phase_framework._maybe_bench_untested_proposals())
     [task] = [task for task in asyncio.run(coord.tasks.queued()) if task.kind == "explore"]
-    [variant] = _grid_variants_from_payload(task.params["grid"])
+    [variant] = grid_variants_from_payload(task.params["grid"])
     asyncio.run(
         coord.recipe_journal.fact_write_hook(
             task=task,
@@ -515,7 +516,7 @@ def test_an_auto_benched_specialist_proposal_publishes_its_reasoning_citations_a
                         "reason": "gain_below_threshold",
                         "fingerprint": "fp-auto",
                         "metrics": {"base_tput": 100.0, "tput": 99.0, "gain_pct": -1.0},
-                        "variant": {"extra_server_args": variant.extra_server_args, **_decision_fields(variant)},
+                        "variant": {"extra_server_args": variant.extra_server_args, **decision_fields(variant)},
                         "measured_against": {"throughput": 100.0, "extra_server_args": ""},
                         "gates": [{"gate": "keep_threshold", "passed": False, "observed": -1.0, "threshold": 3.0}],
                     }

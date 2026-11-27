@@ -186,6 +186,7 @@ DOTENV_EXACT_ALLOWLIST: frozenset[str] = frozenset(
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_MODEL",
         "CODEX_MODEL",
+        "DATASET_PATH",
         # Retired provider variables, still readable so a pre-migration .env can be normalized by
         # hyperloom_common.llm.llm_config.deepseek_compat_env.
         "DEEPSEEK_API_KEY",
@@ -249,7 +250,7 @@ DOTENV_PREFIX_ALLOWLIST: tuple[str, ...] = (
 # assets/runtime_env.sh; test_dotenv_allow_list.py holds the two equal and FRAMEWORK's values to the registry.
 DOTENV_NOT_PRIVATE_LENT_VALUES: Mapping[str, frozenset[str]] = MappingProxyType(
     {
-        "FRAMEWORK": frozenset({"atom", "custom", "sglang", "vllm", "xdit"}),
+        "FRAMEWORK": frozenset({"atom", "custom", "llamacpp", "sglang", "vllm", "xdit"}),
         "HF_DATASETS_OFFLINE": frozenset({"0", "1"}),
         "HF_HUB_OFFLINE": frozenset({"0", "1"}),
         "HYPERLOOM_DOTENV_CREDENTIALS": frozenset({"kernel-agent-env"}),
@@ -314,6 +315,7 @@ BLOCKED_EXTERNAL_ENV_NAMES: frozenset[str] = (
             ENV_ISL,
             ENV_OSL,
             ENV_MAX_MODEL_LEN,
+            "DATASET_PATH",
             "PRECISION",
             "PORT",
             ENV_NUM_PROMPTS,
@@ -567,6 +569,23 @@ def _is_file(path: str) -> bool:
         return Path(path).is_file()
     except OSError:
         return False
+
+
+def launch_settings_naming_path_under(
+    root: Path | str, server_args: str, envs: Mapping[str, object] | None
+) -> list[str]:
+    """The launch settings whose value names a path under ``root``: env names, and ``server arguments`` for the string.
+
+    A setting that points the server at a file is a file change carried in by name, whatever the setting is called,
+    so the question is asked of every value rather than of the config-file envs alone.
+    """
+    spellings = {str(root).rstrip("/"), str(Path(root).resolve()).rstrip("/")} - {""}
+
+    def names_root(value: object) -> bool:
+        return any(spelling in str(value or "") for spelling in spellings)
+
+    naming = ["server arguments"] if names_root(server_args) else []
+    return naming + sorted(str(key) for key, value in (envs or {}).items() if names_root(value))
 
 
 def ungrounded_env_file_reason(envs: Mapping[str, object] | None) -> str | None:
@@ -927,6 +946,7 @@ __all__ = [
     "is_launch_provided_env_name",
     "is_python_package_root",
     "is_secret_shaped_env_name",
+    "launch_settings_naming_path_under",
     "operator_extra_env",
     "redact_file_in_place",
     "redact_secret_env_values",

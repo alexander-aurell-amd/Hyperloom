@@ -15,7 +15,10 @@ and validity stay in Hyperloom.
 
 A fresh session resolves its base launch once, at launch, and freezes it as
 `<session>/base_launch.json` (schema `hyperloom-base-launch/1`). A resume reads
-that file and resolves nothing. Sources are tried in this order, and the first that
+that file and resolves nothing. An InferenceX base also records, under `point`,
+the concurrencies its arm publishes (`source_concs`) and the launch the arm binds
+at each (`source_launches`: `conc`, `args`, `env`, laid out as the base's own),
+which the concurrency sweep seeds each point with; neither enters the digest. Sources are tried in this order, and the first that
 holds a launch for the session's model, board, workload, concurrency, TP and EP
 gives the base:
 
@@ -29,7 +32,21 @@ gives the base:
 3. the framework's cookbook: the SGLang cookbook, the vLLM recipes site, or
    ATOM's catalog (fixed workloads only);
 4. for a fixed workload only, the default table shipped in
-   `src/inference_suite/recipe/defaults/table.yaml`.
+   `src/inference_suite/recipe/defaults/table.yaml`: the framework's row for the
+   architecture the session's card reports (the query's `gfx`), else the
+   framework's fallback row (`--trust-remote-code` alone), with a warning that
+   names the architecture no row was tuned for, or that the architecture is
+   unknown when the session read no card.
+
+A recipe serves only the board it was tuned on, compared by name: an InferenceX
+point whose runner stands for that board, an SGLang cookbook cell or AgentX
+launch whose `hw` is that board, an SGLang page block whose nearest heading
+naming exactly one board (of those the cookbook's cells name, and the session's)
+names it, a whole word in any case, an ATOM catalog entry whose runner label has
+it as one of its dash-separated words, and an ATOM page block whose nearest
+heading naming an MI board names it. A recipe tuned on another board, however
+alike, is not taken; to run it, write it as a launch script and pass that as
+`--reference-script`.
 
 An AgentX session that no recipe and no `--reference-script` serves is refused.
 When a source cannot be read, a fixed session runs the default table, unless
@@ -68,9 +85,16 @@ two (`-tp 8`, `--tp 8`).
 
 A launch script, frozen base or default row that needs more GPUs than `--gpus` is
 refused, naming both counts.
-A frozen base resolved for another model, workload or framework, or for a board
-of another architecture or HBM capacity than the session's, is refused, naming both
-values.
+A frozen base resolved for another model, workload or framework is refused,
+naming both values. So is one resolved for another board, unless both its query
+and the session's record the card they ran on (`gfx` and `memory_mib`) and the two
+agree; a base frozen before queries recorded the card serves its own board alone.
+
+The query (`query` in `base_launch.json`, and `resolve --query`) names the model,
+framework, board, workload, concurrencies, TP, EP and sequence shape, and the card
+the session read: its architecture `gfx` and memory size `memory_mib`, both `null`
+when the session read no card. A query written before those two keys existed reads
+them as `null`. The query is not part of the digest.
 
 An InferenceX entry of the session's model that its config cannot place (a runner
 on no board label, a missing key) is that entry's miss; entries of other models are
@@ -123,6 +147,18 @@ spelled. A base whose entrypoint is not its framework's is refused
 (`config_invalid`); name another install with the server's `framework_python`
 instead.
 
+llama.cpp (`llamacpp`) is a native server: the round runs `llama-server` as the
+launch environment's `PATH` resolves it, records the version its `--version`
+prints, and holds its flags to the ones its `--help` lists, read once per binary:
+a flag it does not list, or lists as removed, is refused (`flag_unknown`) before
+the server starts. A `llama-server` missing from `PATH` or whose `--help` fails
+stops the round (`framework_version_unknown`). Its model directory holds the one `.gguf` the server loads,
+which the guard passes as `--model`, beside the
+Hugging Face tokenizer files the load client reads. No recipe source knows it, so
+its base is the operator's launch script. An eval reads the context the server
+serves from the launch's `-c` / `--ctx-size`, else from the model directory's
+`config.json`; a round with neither stops as `eval_context_too_short`.
+
 ## Launch layers
 
 A round's launch is composed in a fixed order, and `launch.json` records the layer
@@ -137,7 +173,11 @@ that set each flag and environment variable and what it overrode:
    and the framework's own ready timeout (`VLLM_ENGINE_READY_TIMEOUT_S`,
    `SGLANG_WARMUP_TIMEOUT`) at 10800 s, the largest value an InferenceX recipe
    sets and above Hyperloom's default boot limit, so a slow start ends at the
-   round's `boot_sec` as `server_boot_timeout`, not at the framework's 600 s;
+   round's `boot_sec` as `server_boot_timeout`, not at the framework's 600 s.
+   A round whose test has a boot budget (`deadlines.boot_budget_sec`, from a
+   run's `--boot-budget-sec`) sets it to the budget plus 3600 s when that is
+   longer, the same headroom over the boot limit, so the 10800 s is not above
+   such a round's boot;
 6. the runner's layer: the environment and floors a host needs, and the
    framework's metrics switch (`--enable-metrics` for SGLang; vLLM and ATOM need none)
    when the round samples KV telemetry;
@@ -162,6 +202,65 @@ as `--benchmark-duration`. The harness's `agentx` scenario holds the replay to 9
 latency coverage of that duration, so no request count bounds it. Below 900 s, the
 scenario's minimum, the round adds `--unsafe-override`; use 600 s or 900 s for
 quick tests.
+
+A fixed round sends InferenceX's random prompts of `ISL` tokens, each answered to
+exactly `OSL` tokens. A point that sets `DATASET_PATH`, an absolute path to a JSONL
+file whose lines each hold a `prompt` string or a `turns` list (the first turn is
+sent), sends those prompts instead through `inference_suite.load.dataset_client`:
+one user message each to `/v1/chat/completions`, rendered by the server's chat
+template, at temperature 0 with `max_tokens` the `OSL` and EOS honoured.
+Each pass sends its prompt count from the file's lines, shuffled by its seed and
+cycled, so every arm sends the same requests. A measured round's count is the number
+of prompts in the file, so it sends the whole file once at every concurrency level;
+a point without a dataset sends its concurrency times 10, 5, 3 or 2, fewer the
+longer `ISL` + `OSL`. The count is written
+into the point as `NUM_PROMPTS` when the point is rendered, on the host that renders
+it: a file that host cannot read, or a line that holds no prompt, fails the render
+naming the file. `NUM_PROMPTS` is not read from the environment; a point's own
+`envs.NUM_PROMPTS` and `hyperloom optimize --extra-env NUM_PROMPTS=<n>` override the
+count in the baseline round and the candidate rounds, which are rendered from the
+session's baseline config. A concurrency sweep sets its own count per rung, for a
+dataset session the file's prompt count whatever is pinned. A boot round sends one
+request. A profile round keeps its own count over a point's `envs.NUM_PROMPTS`, but
+an `--extra-env NUM_PROMPTS=<n>` reaches it too. Pass a shorter file to send fewer.
+A round whose concurrency is above the file's prompt count never has
+that many requests in flight, and the client's stderr says so; at concurrency 1 the
+whole file is sent one request at a time, inside the same
+`INFERENCE_OPTIMIZER_BENCHMARK_TIMEOUT_SEC` as any round. A session
+with a dataset serves the model's own context window, as an AgentX session does, in
+place of `ISL` + `OSL` plus headroom, since the prompts carry their own lengths;
+`MAX_MODEL_LEN` still overrides it. A prompt the server answers with a 4xx status, as it
+does one longer than the window, fails the pass and so the round: the metrics would
+describe the rest of the file only. The client's stderr names each such prompt's line
+and status, and `benchmark_outcome.refused` of the result lists them. Any other failed
+request fails the pass above a 5 % failed share. Token counts are the server's `usage`;
+a request without one fails. The client saves the keys a fixed round reads in
+`client/inferencex_result.json`.
+A `hyperloom optimize` session records the dataset it was seeded with, the path as
+given, in `prompt_dataset` of its `state.json`. A resume whose `DATASET_PATH` is
+another file, or none where the session recorded one, is refused, as a resume in
+another benchmark mode is. `ISL` and `OSL` do not describe such a session's requests,
+so the stores keyed on them leave it out: it publishes and reads no Experience, and
+the Recipe KB neither warm-starts it nor takes its recipe (CLOSE records
+`prompt_dataset_identity_unsupported`). A `hyperloom-multibranch run` session records
+the `DATASET_PATH` exported when it starts in its workload, beside `ISL` and `OSL`
+(`settings.workload.inferencex.dataset` of its manifest), and in its session profile.
+Every leg exports the recorded value and removes one the session did not record, so a
+`--resume` or a `final-only` sends what the first leg sent whatever its shell exports.
+A recipe whose launch sets `DATASET_PATH` is refused, a launch that unsets it leaves
+it in place, and the dataset is part of a point's `surface_sha256` when it sends one.
+A lesson of another session that sent other prompts, a dataset against random prompts
+in either direction, is recalled less alike, with `dataset` among the conditions that
+differ; a playbook trial pairs only sessions on the same prompts; the session's Recipe
+KB warm start and write-back are skipped. Tree statistics (stall odds, pace, menu
+families) pool sessions across prompt sources, as they do across `ISL` and `OSL`.
+Exported in the environment of `hyperloom optimize` or
+`hyperloom-multibranch run`, the name reaches every rendered point. The file is read
+where the round runs, first by the round before it starts its server: a file it
+cannot read, or a line that holds no prompt, fails the round as
+`config_invalid`. A confined runner of a `hyperloom-multibranch run` test reads it
+only in a tree its sandbox shows, such as the model directory or the Hugging Face
+hub cache.
 
 ## Server lifecycle
 
@@ -230,7 +329,7 @@ python -m inference_suite.staging check --tool-cache <dir>
 
 ## Command line
 
-`python -m inference_suite` has five commands:
+`python -m inference_suite` has six commands:
 
 | Command | Behavior |
 |---|---|
@@ -239,14 +338,15 @@ python -m inference_suite.staging check --tool-cache <dir>
 | `resolve --query <query.json> --gpus <n> --out <base_launch.json> [--user-file <file>] [--inferencex-commit <sha>]` | Reads the sources once and writes the base they give, printing its digest. With `--inferencex-commit`, InferenceX is read at that commit instead of the head of its `main`. |
 | `stage --tool-cache <dir> [--source <InferenceX repository>]` | Stages the pinned tools into the tool cache unless it holds them intact, fetching InferenceX at its pin without `--source`, and prints the manifest's sha256. |
 | `publish --stagings <dir> [--source <InferenceX repository>]` | Publishes the staging of the pins in force as `<dir>/<staging key>`, staging it there when absent, and prints its path. |
+| `multinode resolve`, `start`, `restart`, `stop` | Resolves the PD launch of the node list's cluster (`HYPERLOOM_MN_NODE_LIST`) and writes `pd_launch.json`; `start`, `restart` and `stop` act on that frozen launch on the node list's hosts. `restart` takes per-role `--<role>-args` overrides. |
 
 Exit codes: `0` when the round completed (or nothing survived `stop`, a base was
-written, or a staging is in place); `1` when the round did not complete, or a
-process outlived `stop`; `2` when the config, query or pidfile breaks its contract,
+written, or a staging is in place); `1` when the round did not complete, a
+process outlived `stop`, or a `multinode` cluster did not come up; `2` when the config, query or pidfile breaks its contract,
 the run directory is not empty, no source holds a base, in which case each
 source's reason is printed to stderr, `--inferencex-commit` is refused, a source
 answers in a form resolve cannot read (an HTML page where JSON was asked), or a staging cannot be built or verified,
-printed as `staging_missing: <reason>`.
+printed as `staging_missing: <reason>`, or a `multinode` input is refused.
 
 ## Run directory
 
@@ -259,11 +359,12 @@ One round writes one run directory and leaves it unchanged once the round ends.
 | `report.json` | What the round measured, or the step it failed at (`inference-suite-report/2`). Written last. |
 | `server.log` | The server's log. A `boot` or `reuse` round copies the bytes logged during the round and records their range. |
 | `server_ready_at` | `<ready unix time> <boot seconds>`; `0` boot seconds for a reused server. |
-| `server_boot_active_at` | `<unix time>`: the last time the booting server's processes were seen using at least a quarter of a CPU. The round rewrites it on each such sighting, so a watcher of the run directory sees the boot write. A boot that neither logs nor uses a quarter of a CPU for `pre_ready_silence_sec` ends as `server_silent_before_ready`; so does one whose log stays silent for 3600 s however busy its processes are, as a spinning collective is busy too. |
+| `server_boot_active_at` | `<unix time>`: the last time the booting server was seen working without a log line: its processes used at least a quarter of a CPU, or grew their resident memory (`VmRSS`) or the bytes they read (`rchar` + `read_bytes`) by at least 64 MiB per 10 s. The round rewrites it on each such sighting, so a watcher of the run directory sees the boot write. Memory or read growth is progress: it restarts the silence like a log line, and only the boot budget bounds it (memory is read because pre-faulting a file mapped from a network filesystem grows neither IO counter). A boot that neither logs, grows nor uses a quarter of a CPU for `pre_ready_silence_sec` ends as `server_silent_before_ready`; so does one that neither logs nor grows for 3600 s however busy its processes are, as a spinning collective is busy too. A reading that cannot be taken never counts. |
 | `server.pid` | An `own` round's pidfile while its server runs; `boot` and `reuse` keep theirs in `pid_dir`. |
 | `phase_marks.json` | The instants the round passed from one phase to the next. |
 | `kv_metrics.json`, `agentx_timeline.jsonl` | KV-cache samples and the AgentX request timeline. |
 | `power.json` | Every power reading the node gave over the whole round; see [Power](#power). |
+| `weight_prefetch.json` | What the checkpoint prefetch did while the server booted, only when `HYPERLOOM_WEIGHT_PREFETCH=1` turned it on: the chosen files, the skip reason, the totals, the bytes read and the unreadable file count. See [Checkpoint prefetch](environment-variables.md#checkpoint-prefetch). |
 | `client/` | `stdout.log`, `stderr.log`, `agentx_client.log`, `inferencex_result.json`, `aiperf_artifacts/` (`profile_export.jsonl`, `profile_export_aiperf.json`, `logs/aiperf.log`) and, on an MLPerf round, `mlperf_artifacts/` (the harness's `result_summary.json` and `scores.json`). |
 | `eval/` | `stdout.log`, `stderr.log`, lm-eval's `results_<time>.json`, `hyperloom_eval_probe.json` and `definition.json`. |
 | `profile/` | `torch_trace/`, `capture_traces/`, `graph_capture_profile/` and `capture.json`. |
@@ -357,6 +458,7 @@ A round that did not complete names one `failed_step`:
 | Server | `server_exited_before_ready`, `server_silent_before_ready`, `server_boot_timeout`, `server_stalled`, `server_died` |
 | Client | `client_failed`, `client_output_missing` |
 | Eval | `eval_failed` |
+| Profile | `profile_refused` |
 | Any | `round_timeout`, `deadline_exhausted`, `cancelled`, `teardown_incomplete` |
 
 Every metric key is fixed: a metric nobody measured is `null`, never `0`. An eval

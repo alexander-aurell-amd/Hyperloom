@@ -16,17 +16,17 @@ from hyperloom.orchestrator.actions.executors.explore import ExploreExecutor
 from hyperloom.inference_optimizer.canonical_fingerprint import (
     canonical_fingerprint,
 )
-from hyperloom.orchestrator.actions.executors._grid_runner import GridRecipe, GridVariant
-from hyperloom.orchestrator.actions.executors._grid_variant_filter import apply_compatibility_filter
-from hyperloom.orchestrator.actions.executors._grid_variant_filter import ServingStack
-from hyperloom.orchestrator.actions.executors._launch_evidence import RequestedLaunch, build_launch_evidence
-from hyperloom.orchestrator.actions.executors._grid_base import _atom_default_grid
-from hyperloom.orchestrator.actions.executors.explore import (
+from hyperloom.orchestrator.actions.executors.grid._grid_runner import GridRecipe, GridVariant
+from hyperloom.orchestrator.actions.executors.grid._grid_variant_filter import apply_compatibility_filter
+from hyperloom.orchestrator.actions.executors.grid._grid_variant_filter import ServingStack
+from hyperloom.orchestrator.actions.executors.workload._launch_evidence import RequestedLaunch, build_launch_evidence
+from hyperloom.orchestrator.actions.executors.grid._grid_base import _atom_default_grid
+from hyperloom.orchestrator.actions.executors.explore_prefilter.launch_filters import (
     filter_baseline_noop_variants,
     observed_launch_from_state,
     restates_the_baseline_launch,
 )
-from hyperloom.orchestrator.actions.executors._launch_restatement import Launch, launch_change, named_settings
+from hyperloom.orchestrator.actions.executors.workload._launch_restatement import Launch, launch_change, named_settings
 from hyperloom.orchestrator.state.shared_state import SharedState
 from hyperloom.orchestrator.bus.resource_lock import (
     SqliteLeaseBackend,
@@ -36,7 +36,7 @@ from hyperloom.orchestrator.state.task_registry import TaskRegistry, TaskSpec
 from hyperloom.orchestrator.bus.storage.connection import SqliteConnection
 
 from .conftest import write_benchmark_yaml
-from hyperloom.orchestrator.actions.executors._workload_envs import BenchmarkTarget, LaunchLayer
+from hyperloom.orchestrator.actions.executors.workload._workload_envs import BenchmarkTarget, LaunchLayer
 
 
 @pytest.fixture(autouse=True)
@@ -641,7 +641,7 @@ def test_warm_history_rejected_rows_survive_the_first_round():
 
 
 def test_observed_launch_after_drops_only_what_the_stack_changed():
-    from hyperloom.orchestrator.actions.executors._launch_restatement import observed_launch_after
+    from hyperloom.orchestrator.actions.executors.workload._launch_restatement import observed_launch_after
 
     opening = {
         "extra_server_args": "--a 1",
@@ -853,6 +853,107 @@ async def test_explore_executor_atom_empty_grid_seeds_default_grid(
     assert "atom_dp_attn" in flat_names
 
 
+_AITER_ON = {"VLLM_ROCM_USE_AITER": "1", "VLLM_ROCM_USE_AITER_MOE": "1"}
+_MOE_INIT_DEATH = (
+    "(EngineCore_DP0 pid=7) ERROR ValueError: Unquantized MoE backend 'ROCm AITER' is unsupported\n"
+    "(APIServer pid=1) RuntimeError: Engine core initialization failed. See root cause above."
+)
+
+
+async def _explore_after_a_dead_change(runner, tmp_path, monkeypatch, *, died, grid, **params):
+    """Run an explore task whose session saw v00's AITER pair stop a server before ready; the launched names and result."""
+    from hyperloom.inference_optimizer.canonical_fingerprint import workload_signature
+    from hyperloom.orchestrator.actions.executors import explore as explore_mod
+    from hyperloom.orchestrator.actions.executors.grid._grid_base import VariantResult
+
+    sub, tr, _ = runner
+    base = tmp_path / "base.yaml"
+    write_benchmark_yaml(base)
+    v00 = {"name": "v00_enable_aiter_moe", "extra_envs": dict(_AITER_ON)}
+    state = SharedState()
+    if died == "an_earlier_round":
+        row = {
+            **v00,
+            "round_id": "explore-001",
+            "outcome": "FAILED",
+            "workload_signature": workload_signature(),
+            "extra_server_args": "",
+            "error_class": "server_init_dead",
+            "error_excerpt": _MOE_INIT_DEATH,
+        }
+        state.explore_search = {"tested": {"fp-v00": row}}
+    launched: list[str] = []
+
+    async def _capture_run_grid(**kwargs):
+        grid = kwargs.get("grid") or []
+        launched.extend(v.name for v in grid)
+        if grid and grid[0].name == v00["name"]:
+            return [VariantResult(v00["name"], "", {}, "failed", error=_MOE_INIT_DEATH, error_class="server_init_dead")]
+        return []
+
+    monkeypatch.setattr(explore_mod, "run_grid", _capture_run_grid)
+    task, _ = await tr.create_or_return_existing(
+        TaskSpec(
+            kind="explore",
+            params={
+                "config_path": str(base),
+                "base_tput": 800.0,
+                "grid": grid if died == "an_earlier_round" else [v00, *grid],
+                **params,
+            },
+            idempotency_key=f"ex-known-dead-change-{died}-{sorted(params)}",
+        ),
+    )
+    sub.register_executor("explore", ExploreExecutor(session_dir=tmp_path))
+    res = await sub.run_task(task, extra_context={"shared_state": state})
+    return launched, res.result
+
+
+_SIBLING = {"name": "v02_aiter_moe_plus_knob", "extra_envs": {**_AITER_ON, "HL_KNOB": "1"}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("died", ["an_earlier_round", "this_round"])
+async def test_explore_executor_never_launches_a_variant_carrying_a_change_that_died_at_init(
+    sub_agent_runner,
+    tmp_path,
+    monkeypatch,
+    died,
+):
+    """#2751: once v00's AITER pair stopped its server before ready, a variant carrying that pair is not launched."""
+    grid = [dict(_SIBLING), {"name": "v01_knob_only", "extra_envs": {"HL_KNOB": "1"}}]
+    launched, result = await _explore_after_a_dead_change(sub_agent_runner, tmp_path, monkeypatch, died=died, grid=grid)
+
+    assert "v02_aiter_moe_plus_knob" not in launched
+    assert "v01_knob_only" in launched
+    skipped = {s["name"]: s for s in result["skipped_dup"]}
+    assert skipped["v02_aiter_moe_plus_knob"]["reason"] == "known_dead_change"
+    assert "v00_enable_aiter_moe" in skipped["v02_aiter_moe_plus_knob"]["detail"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("exempt", ["stack_revalidation", "kernel_overlay"])
+async def test_explore_executor_still_launches_a_revalidation_or_an_overlay_that_carries_a_dead_change(
+    sub_agent_runner,
+    tmp_path,
+    monkeypatch,
+    exempt,
+):
+    """A revalidation re-measures the stack on purpose, and an overlay changes the code the death was seen on."""
+    sibling = dict(_SIBLING)
+    params: dict[str, str] = {}
+    if exempt == "stack_revalidation":
+        params["source"] = "stack_revalidate"
+    else:
+        sibling["overlay_pythonpath"] = str(tmp_path)
+    launched, result = await _explore_after_a_dead_change(
+        sub_agent_runner, tmp_path, monkeypatch, died="an_earlier_round", grid=[sibling], **params
+    )
+
+    assert "v02_aiter_moe_plus_knob" in launched
+    assert all(s.get("reason") != "known_dead_change" for s in result.get("skipped_dup") or [])
+
+
 @pytest.mark.asyncio
 async def test_explore_executor_sglang_empty_grid_still_fails_with_empty_grid(
     sub_agent_runner,
@@ -881,7 +982,7 @@ async def test_explore_executor_sglang_empty_grid_still_fails_with_empty_grid(
 
 def _lever_state() -> SharedState:
     """A session whose specialist has authored two dormant, dependency-chained rewrite levers."""
-    from hyperloom.orchestrator.actions.executors import _framework_switch_manifest as manifest
+    from hyperloom.orchestrator.actions.executors.framework_change import _framework_switch_manifest as manifest
 
     switches, problems = manifest.parse_manifest(
         [
@@ -897,21 +998,22 @@ def _lever_state() -> SharedState:
 
 def test_a_leave_one_out_arm_that_regressed_attributes_its_lever():
     """Dropping a kept switch and getting slower is a REVERT, and it is the reading that says the switch pays."""
-    from hyperloom.orchestrator.actions.executors.explore import _framework_lever_attributions, _outcome_row
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import framework_lever_attributions
+    from hyperloom.orchestrator.actions.executors.grid._explore_variants import outcome_row
 
-    row = _outcome_row(
+    row = outcome_row(
         {"name": "fwlever_drop_hl_a", "outcome": "REVERT", "gain_pct": None, "graded_gain_pct": -4.0}, "fp", "", "t"
     )
     seed = {"name": "fwlever_drop_hl_a", "framework_lever": "HL_A", "framework_lever_source": "leave_one_out"}
 
-    attributions = _framework_lever_attributions([row], [seed])
+    attributions = framework_lever_attributions([row], [seed])
 
     assert [(a["switch"], a["gain_pct"], a["outcome"]) for a in attributions] == [("HL_A", 4.0, "REVERT")]
 
 
 def test_a_lever_attribution_arm_runs_after_the_candidates_that_could_keep():
     """Additive lever arms may KEEP and run first; leave-one-out arms only attribute and run last."""
-    from hyperloom.orchestrator.actions.executors.explore import _lever_seeded_payload
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import _lever_seeded_payload
 
     levers = [
         {"name": "fwlever_drop_hl_a", "framework_lever": "HL_A", "framework_lever_source": "leave_one_out"},
@@ -948,7 +1050,7 @@ def test_unified_attn_filter_matches_aiter_dist_version_short_sha(tmp_path):
         serving=ServingStack(
             "sglang",
             str(model),
-            gpu_type="mi355x",
+            gfx="gfx950",
             stack_fingerprint={
                 "sglang": "0.5.20.dev20260920+gc610c40399",
                 # The dist version install_baremetal.sh falls back to; embeds the short sha of the pinned commit.
@@ -979,8 +1081,8 @@ def test_atom_default_grid_survives_compatibility_filter():
 
 def test_grid_variants_from_payload_coerces_list_extra_args():
     """A JSON-list ``extra_args`` must be space-joined into a shell-arg string, not stringified into a Python repr."""
-    from hyperloom.orchestrator.actions.executors.explore import (
-        _grid_variants_from_payload,
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import (
+        grid_variants_from_payload,
     )
 
     payload = [
@@ -988,7 +1090,7 @@ def test_grid_variants_from_payload_coerces_list_extra_args():
         {"name": "str_args", "extra_args": "--block-size 64"},
         {"name": "tuple_server_args", "extra_server_args": ("--distributed-executor-backend", "mp")},
     ]
-    by_name = {v.name: v for v in _grid_variants_from_payload(payload)}
+    by_name = {v.name: v for v in grid_variants_from_payload(payload)}
 
     assert by_name["list_args"].extra_server_args == "--max-num-batched-tokens 32768"
     assert "[" not in by_name["list_args"].extra_server_args
@@ -997,8 +1099,8 @@ def test_grid_variants_from_payload_coerces_list_extra_args():
 
 
 def test_grid_variants_from_payload_carries_removal_controls():
-    from hyperloom.orchestrator.actions.executors.explore import (
-        _grid_variants_from_payload,
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import (
+        grid_variants_from_payload,
     )
 
     payload = [
@@ -1011,7 +1113,7 @@ def test_grid_variants_from_payload_carries_removal_controls():
         }
     ]
 
-    variant = _grid_variants_from_payload(payload)[0]
+    variant = grid_variants_from_payload(payload)[0]
     assert variant.remove_args == ["--enable-prefix-caching"]
     assert variant.unset_envs == ["SGLANG_ENABLE_FOO"]
     assert variant.args_mode == "replace"
@@ -1019,11 +1121,11 @@ def test_grid_variants_from_payload_carries_removal_controls():
 
 
 def test_grid_variants_preserve_authored_reason_as_experience_reasoning():
-    from hyperloom.orchestrator.actions.executors.explore import (
-        _grid_variants_from_payload,
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import (
+        grid_variants_from_payload,
     )
 
-    variant = _grid_variants_from_payload(
+    variant = grid_variants_from_payload(
         [
             {
                 "name": "chunked",
@@ -1039,11 +1141,11 @@ def test_grid_variants_preserve_authored_reason_as_experience_reasoning():
 
 
 def test_grid_variants_do_not_treat_provenance_as_reasoning():
-    from hyperloom.orchestrator.actions.executors.explore import (
-        _grid_variants_from_payload,
+    from hyperloom.orchestrator.actions.executors.explore_prefilter.grid_payload import (
+        grid_variants_from_payload,
     )
 
-    variant = _grid_variants_from_payload(
+    variant = grid_variants_from_payload(
         [{"name": "unexplained", "extra_args": "--foo", "provenance": "specialist:scheduler"}]
     )[0]
 
@@ -1052,7 +1154,7 @@ def test_grid_variants_do_not_treat_provenance_as_reasoning():
 
 
 def test_on_disk_stderr_tail_reads_benchmark_stderr_log(tmp_path):
-    from hyperloom.orchestrator.actions.executors._grid_runner import (
+    from hyperloom.orchestrator.actions.executors.grid._round_report import (
         _on_disk_stderr_tail,
         _report_errors_summary,
     )

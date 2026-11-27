@@ -123,7 +123,7 @@ key, export the new one and re-run `install.sh`.
 Nor does such a `.env` lend anything that would let that account run code as you
 or see your traffic. `install.sh` and the CLI preflight take from it only a few
 choices among values Hyperloom ships, each with one of its listed values:
-`FRAMEWORK` (`atom`, `custom`, `sglang`, `vllm`, `xdit`), `HF_HUB_OFFLINE` and
+`FRAMEWORK` (`atom`, `custom`, `llamacpp`, `sglang`, `vllm`, `xdit`), `HF_HUB_OFFLINE` and
 `HF_DATASETS_OFFLINE` (`0`, `1`), `HYPERLOOM_RUN_MODE` (`baremetal`, `docker`),
 `HYPERLOOM_LLM_MODE` (`anthropic`, `deepseek`, `openai`),
 `HYPERLOOM_FRAMEWORK_ENV` (`isolated`, `shared`) and `HYPERLOOM_DOTENV_CREDENTIALS`
@@ -179,7 +179,7 @@ Downstream tooling reads the side it belongs to:
 * GEAK runs Claude Code, so it uses the Anthropic-side base URL + key plus
   `GEAK_CLAUDE_MODEL`. An OpenAI-only deployment cannot start it.
 * Kernel tools inherit the OpenAI-side credential under its own name,
-  `OPENAI_API_KEY`, which is what crosses the Ray boundary to a worker.
+  `OPENAI_API_KEY`.
 * Orchestration Claude uses the Anthropic-side base URL + key, including the
   generated `~/.claude/config.json` primary key.
 * Critic-agent uses the OpenAI side for KB summary / synthesis calls.
@@ -427,4 +427,4 @@ and all aliases pick up the new value on the next CLI launch.
 Use these resources for related configuration and reference information:
 
 * [Environment variables](environment-variables.md): Every environment variable read by the code, including non-credential tunables.
-* [Troubleshooting Hyperloom](troubleshooting.md): Common 401 / gateway / Ray-GPU symptoms.
+* [Troubleshooting Hyperloom](troubleshooting.md): Common 401 / gateway / GPU symptoms.

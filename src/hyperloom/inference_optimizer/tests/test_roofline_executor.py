@@ -801,11 +801,8 @@ async def test_the_profile_runs_as_a_child_task_of_the_roofline(tmp_path):
 # N10: Coordinator persists roofline executor SharedState mutations to state.json.
 import json
 
-from hyperloom.orchestrator.roles import (
-    MockBackend,
-    MockCriticBackend,
-    ScriptedPlan,
-)
+from hyperloom.orchestrator.roles import MockCriticBackend
+from hyperloom.orchestrator.tests.mock_backend import MockBackend, ScriptedPlan
 from hyperloom.orchestrator.loop.coordinator import Coordinator
 from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
 from hyperloom.inference_optimizer.session.paths import make_session_dir
@@ -1539,6 +1536,26 @@ async def test_the_compute_bound_reprofile_reports_both_of_its_steps(tmp_path, m
         "profile_compute_bound",
         "trace_analyze_compute_bound",
     ]
+
+
+@pytest.mark.asyncio
+async def test_a_pd_session_skips_the_compute_bound_reprofile_it_cannot_apply(tmp_path, monkeypatch):
+    """A node-list PD session keeps its frozen DP attention, so a host-bound trace is not re-profiled there."""
+    md = tmp_path / "analysis.md"
+    md.write_text("# Executive Summary\n", encoding="utf-8")
+    host_bound = _ta_ok(report_md=md)
+    host_bound["trace_health_warnings"] = [{"code": "high_gpu_idle_pct", "severity": "warning"}]
+    profile = _profile_ok("/tmp/decode.gz")
+    profile["role_traces"] = {"decode": "/tmp/decode.gz"}
+    p1, p2, calls = _n26_patch_subs(profile, [host_bound])
+    monkeypatch.setattr(roofline_mod, "is_multi_node", lambda: True)
+
+    executor = RooflineExecutor(shared_state=_state())
+    with p1, p2, progress_scope(_progress_sink([])):
+        result = await executor(_n26_ctx(tmp_path))
+
+    assert result["status"] == "succeeded"
+    assert len(calls["payloads"]) == 1
 
 
 @pytest.mark.asyncio

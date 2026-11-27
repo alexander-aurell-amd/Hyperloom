@@ -13,13 +13,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from hyperloom.common.agentx_workload import is_mlperf_backend
 from hyperloom.common.perf_metric import agentx_active
-from hyperloom.inference_optimizer.breakdown.recorder.baseline_event import RUN_AFTER_MOE_RUNNER_FAILURE, RUN_INITIAL
 from hyperloom.inference_optimizer.trace.task_progress import heartbeat_while_output_flows
 from inference_suite.contracts import FailedStep
 from inference_suite.server_log import death_excerpt
@@ -30,8 +29,7 @@ from .._accuracy_gate import (
     parse_eval_results,
 )
 from .._failed_step import failed_step_error_class
-from .._grid_runner import lease_cards, session_grid_bounds
-from .._ray_serving import ServingLease, maybe_serving_lease
+from ..grid._grid_inputs import session_grid_bounds
 from .._subprocess_kill import resolve_benchmark_timeouts
 from .._suite.rounds import AccuracyRound, SuiteRoundRefused, deadline_unix, run_accuracy_suite_round, session_route
 from .records import (
@@ -96,40 +94,31 @@ async def run_accuracy_round(request: AccuracyRound, *, session: Path) -> Accura
     """Run the D9 accuracy round ``request`` names into ``<slot>/accuracy``.
 
     The round serves the slot's launch on a server of its own with the base's golden layer left out, and runs only the
-    eval. A request without a serving lease runs on one of its own when Ray manages the GPUs.
+    eval.
     """
     slot = request.slot
     route = session_route(session)
     if route is None:
         log.error("accuracy_round: %s froze no base launch to serve the accuracy round on", session)
         return AccuracyRoundOutcome(slot, failed_step_error_class(FailedStep.CONFIG_INVALID))
-    owned = None
-    if request.serving_lease is None:
-        owned = maybe_serving_lease(num_gpus=lease_cards(request.config_path, session))
-        request = replace(request, serving_lease=owned)
     try:
         async with heartbeat_while_output_flows(unit="accuracy_round", label="eval") as activity:
             ran = await asyncio.to_thread(run_accuracy_suite_round, route, request, on_poll=activity.note)
     except SuiteRoundRefused as exc:
         log.error("accuracy_round: refused before it ran: %s", exc)
         return AccuracyRoundOutcome(slot, exc.error_class)
-    finally:
-        if owned is not None:
-            owned.close()
     step = ran.report.failed_step
     return AccuracyRoundOutcome(ran.layout.root, "" if step is None else failed_step_error_class(step))
 
 
-async def run_candidate_accuracy_round(
-    slot: Path, launch: Path, state: Any, *, session: Path, lease: ServingLease | None = None
-) -> AccuracyRoundOutcome:
+async def run_candidate_accuracy_round(slot: Path, launch: Path, state: Any, *, session: Path) -> AccuracyRoundOutcome:
     """Run the accuracy round of a candidate whose throughput cleared the KEEP threshold, capped as a benchmark round.
 
-    ``launch`` is the AgentX point the candidate ran in ``slot``; ``lease`` is the serving lease its gate still holds.
+    ``launch`` is the AgentX point the candidate ran in ``slot``.
     """
     timeout_sec = resolve_benchmark_timeouts()[1]
     deadline = deadline_unix(session_grid_bounds(state)[0])
-    return await run_accuracy_round(AccuracyRound(launch, slot, timeout_sec, deadline, lease), session=session)
+    return await run_accuracy_round(AccuracyRound(launch, slot, timeout_sec, deadline), session=session)
 
 
 def record_accuracy_round(result: dict[str, Any], outcome: AccuracyRoundOutcome) -> None:
@@ -144,17 +133,11 @@ class _BaselineAccuracyMixin:
     """Eval-failure routing and the accuracy stop of a benchmark run."""
 
     @staticmethod
-    def _failure_carries_markers(
-        result: dict[str, Any],
-        markers: tuple[str, ...],
-        context_markers: tuple[str, ...] | None = None,
-    ) -> bool:
+    def _failure_carries_markers(result: dict[str, Any], markers: tuple[str, ...]) -> bool:
         """Whether a failed result's error tail, warnings or logs hit a marker."""
 
         def _hit(text: str) -> bool:
-            if not any(m in text for m in markers):
-                return False
-            return not context_markers or any(m in text for m in context_markers)
+            return any(m in text for m in markers)
 
         if _hit(str(result.get("error") or "")):
             return True
@@ -237,9 +220,9 @@ class _BaselineAccuracyMixin:
             for marker in _EVAL_SERVER_UNREACHABLE_MARKERS
         )
 
-    async def _run_retrying(self, ctx: RunnerContext, *, recorder: Any = None) -> dict[str, Any]:
-        """Run the baseline; an eval-rooted failure fails the round, a MoE-runner failure retries once."""
-        result = await self._run_pass(ctx, recorder=recorder, attempt_reason=RUN_INITIAL)
+    async def _run_with_accuracy(self, ctx: RunnerContext, *, recorder: Any = None) -> dict[str, Any]:
+        """Run the baseline and its accuracy round; an eval-rooted failure fails the round."""
+        result = await self._run_pass(ctx, recorder=recorder)
         # An eval that never reached a verdict because the server was gone is a broken measurement, not a statement
         # about accuracy or about a missing framework capability. Leaving it in the eval-rooted branch stamps it as an
         # eval-failure contract and hands it to the enablement lane, which then spends rounds looking for a capability
@@ -283,21 +266,6 @@ class _BaselineAccuracyMixin:
                         "the round fails with no throughput-only retry."
                     )
                 return result
-        if result.get("status") != "succeeded" and self._is_moe_runner_rooted_failure(result):
-            log.warning(
-                "baseline_executor: the server died on a MoE runner backend "
-                "that has no implementation for this checkpoint's quant "
-                "scheme; retrying once without --moe-runner-backend so the "
-                "framework picks the backend itself."
-            )
-            retry = await self._run_pass(
-                ctx,
-                recorder=recorder,
-                attempt_reason=RUN_AFTER_MOE_RUNNER_FAILURE,
-                force_drop_moe_runner_backend=True,
-            )
-            retry.setdefault("nonfatal_warnings", []).append("moe_runner_backend_fallback_dropped_flag")
-            result = retry
         await self._run_baseline_accuracy_round(ctx, result)
         self._maybe_stop_on_missing_baseline_accuracy(ctx, result)
         return result

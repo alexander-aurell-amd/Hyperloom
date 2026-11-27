@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hyperloom-inference_optimizer"
-version = "1.1.5"
+version = "1.2.0"
 description = "Inference Optimizer — two-role (Orchestration/Critic) autonomous LLM inference optimization runtime for AMD GPU platforms. Kernel optimization is handled by programmatic Python handlers."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,7 +27,7 @@ Changelog = "https://github.com/AMD-AGI/Hyperloom/releases"
 Security = "https://github.com/AMD-AGI/Hyperloom/security/policy"
 
 [project.optional-dependencies]
-# LLM backend SDKs, lazy-imported by the Claude/Codex/critic/scorer roles.
+# LLM backend SDKs, lazy-imported by the Claude/Codex/critic roles.
 # ``openai-codex`` is the agent runtime for the OpenAI side: Hyperloom makes no
 # bare LLM API calls, so an OpenAI-only deployment needs it to run at all.
 llm = [
@@ -237,7 +237,7 @@ exclude = [
     "kernelforge.examples.*",
     "kernelforge.knowledge.local_wiki.resources",
     "kernelforge.knowledge.local_wiki.resources.*",
-    # Scripted launch/specialist backends and a virtual clock: scaffolding a
+    # Scripted launch backends and a virtual clock: scaffolding a
     # test drives, not a runtime component. Nothing in the shipped tree imports
     # it, and the production launch boundary it substitutes
     # (``actions/executors/launch_backend.py``) ships as normal.
@@ -277,7 +277,6 @@ exclude = [
 
 [tool.setuptools.package-data]
 hyperloom = [
-    "plugs/profiles/*.json",
     "contracts/*.json",
     "hosted/*.sh",
     "orchestrator/prompts/*.md",
@@ -290,10 +289,8 @@ hyperloom = [
 "hyperloom.inference_optimizer" = [
     "SKILL.md",
     "README.md",
-    "actions/*.md",
     # Release-contract shell installers + configs.
     "assets/*.sh",
-    "assets/*.py",
     "assets/*.example",
     "assets/configs/*.yaml",
     # Workload template for the InferaSim projection EXPLORE pre-filters with.
@@ -317,7 +314,6 @@ hyperloom = [
     "SKILL.md",
     "README.md",
     "actions/*.md",
-    "references/*.md",
 ]
 "hyperloom.agents.quantization" = [
     "SKILL.md",
@@ -374,6 +370,9 @@ inference_suite = [
 "inference_suite.load" = [
     "scripts/*.sh",
 ]
+"inference_suite.multinode" = [
+    "pd_table/*.yaml",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -422,8 +421,9 @@ omit = [
     # tests do run (``scripts/tests`` is in ``testpaths``); it is the measured
     # denominator they stay out of, not the suite.
     "scripts/*",
-    # Byte-identical upstream KB Store SDK; guarded by a blob checksum test.
-    "src/hyperloom/orchestrator/knowledge/remote_recipe/_vendor/*",
+    # The host-side PD driver: sent over SSH and run by ``python3 -`` on each host, and it ptraces the server it
+    # replaces, so its tests run it in a subprocess the coverage run does not follow.
+    "src/inference_suite/multinode/remote_driver.py",
     # CLI drivers.
     "src/hyperloom/inference_optimizer/cli/__init__.py",
     "src/hyperloom/inference_optimizer/cli/session_resume.py",
@@ -436,10 +436,8 @@ omit = [
     "src/hyperloom/inference_optimizer/multi_node/_internal/*",
     # Subprocess wrappers + multi-node server lifecycle.
     "src/hyperloom/orchestrator/actions/executors/_subprocess_kill.py",
-    "src/hyperloom/orchestrator/actions/executors/_multi_node_server_lifecycle.py",
+    "src/hyperloom/orchestrator/actions/executors/serving/_multi_node_server_lifecycle.py",
     "src/hyperloom/orchestrator/actions/executors/_multi_node_env.py",
-    # Breakdown LLM HTTP client.
-    "src/hyperloom/inference_optimizer/breakdown/reporters/llm_client.py",
     # Kernel tools that need real traces or a live framework install.
     "src/hyperloom/orchestrator/trace_analysis/tracelens_analysis.py",
     "src/hyperloom/orchestrator/trace_analysis/tracelens_skill_runner.py",
@@ -449,9 +447,8 @@ omit = [
     "src/hyperloom/orchestrator/kernel/patch_source_check.py",
     "src/hyperloom/orchestrator/kernel/patch_jit_cache.py",
     "src/hyperloom/orchestrator/kernel/patch_rebuild.py",
-    # GEAK runner and Ray cluster lifecycle (subprocess submit).
+    # GEAK runner (subprocess submit).
     "src/hyperloom/orchestrator/kernel/geak_runner.py",
-    "src/hyperloom/orchestrator/actions/executors/_ray_runtime.py",
     # quantization_agent CLI driver (argparse entrypoint).
     "src/hyperloom/agents/quantization/cli.py",
     # OOB server-side runtime (CLI, HTTP server, scheduler, auth proxy, agent
@@ -461,13 +458,12 @@ omit = [
     "OOB/scheduler.py",
     "OOB/auth_proxy.py",
     "OOB/backends/*",
-    # Local-host metrics probes (rocm-smi / nvidia-smi / ps / df / ray status).
     # lm-eval model class, imported only inside the eval process; CI does not install lm-eval.
     "src/inference_suite/eval/model.py",
     # TraceLens server patcher (git apply / patch --fuzz subprocess pipeline).
     "src/hyperloom/orchestrator/actions/executors/_server_patcher.py",
-    "src/hyperloom/orchestrator/actions/executors/_patch_laying.py",
-    # Breakdown collectors — exercised end-to-end by the reporter tests.
+    "src/hyperloom/orchestrator/actions/executors/patching/_patch_laying.py",
+    # Breakdown collectors — exercised end-to-end by the breakdown export tests.
     "src/hyperloom/inference_optimizer/breakdown/collectors/*",
     # Operator CLIs, not library code.
     "src/hyperloom/inference_optimizer/tools/*",
@@ -481,8 +477,6 @@ omit = [
     # Shipped sample drivers, reference kernels, and local-wiki assets.
     "src/kernelforge/examples/*",
     "src/kernelforge/knowledge/local_wiki/resources/*",
-    # Byte-identical upstream KB Store SDK; validated by checksum contract tests.
-    "src/kernelforge/knowledge/kb_store/remote_client.py",
     # CLI entry points (argument plumbing; exercised via the CLIs themselves).
     "src/kernelforge/cli/*",
     # The gemm-tune and forge-fuse pipelines and the stages they drive: agent sessions,
@@ -575,12 +569,10 @@ total_shards = 6
 # Files under a ``tests/`` directory are exempt from every dimension but
 # duplication, as in the style guide's "Size and complexity".
 roots = ["src", "scripts"]
-# Same vendored / shipped-example trees as ``[tool.ruff] extend-exclude``.
+# Same shipped-example trees as ``[tool.ruff] extend-exclude``.
 exclude = [
-    "src/hyperloom/orchestrator/knowledge/remote_recipe/_vendor/kb_store_client.py",
     "src/kernelforge/examples",
     "src/kernelforge/knowledge/local_wiki/resources",
-    "src/kernelforge/knowledge/kb_store/remote_client.py",
 ]
 # SonarSource CPD defaults: a clone is at least 100 tokens and 10 lines (jscpd).
 duplication-min-tokens = 100
@@ -675,12 +667,10 @@ extend-exclude = [
     ".venv",
     "TraceLens-internal",
     "InferenceX",
-    "src/hyperloom/orchestrator/knowledge/remote_recipe/_vendor/kb_store_client.py",
     # Local-wiki resources and example drivers are not source whose style this
     # repository owns.
     "src/kernelforge/examples",
     "src/kernelforge/knowledge/local_wiki/resources",
-    "src/kernelforge/knowledge/kb_store/remote_client.py",
 ]
 
 [tool.ruff.lint]
@@ -763,7 +753,6 @@ ignorelist = ["aiter"]
 # what an unconfigured process prints.
 "src/hyperloom/inference_optimizer/cli/model_gate.py" = ["LOG015"]
 "src/hyperloom/inference_optimizer/model_config_utils.py" = ["LOG015"]
-"src/hyperloom/orchestrator/actions/executors/_geak_sweep.py" = ["LOG015"]
 
 # Markdown formatting in Ruff is still preview/experimental; keep ``ruff format``
 # scoped to Python so CI ``ruff format --check`` does not rewrite docs/skills.

@@ -10,6 +10,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -70,6 +71,8 @@ def test_dry_run_writes_the_source_resolution_artifact(
             str(trace),
             "--workspace-path",
             str(tmp_path / "workspace"),
+            "--target-platform",
+            "MI355X",
             "--dry-run",
         ],
     )
@@ -80,6 +83,19 @@ def test_dry_run_writes_the_source_resolution_artifact(
     resolution_path = Path(result["artifact_paths"]["kernel_source_resolution"])
     assert resolution_path.is_file()
     assert _json.loads(resolution_path.read_text(encoding="utf-8"))["entries"] == []
+
+
+def test_the_target_platform_is_required(tmp_path, monkeypatch, capsys):
+    """No GPU is assumed: a run that names no platform is refused before it starts."""
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["tracelens_analysis.py", "--trace-input", str(tmp_path / "t.json"), "--workspace-path", str(tmp_path)],
+    )
+    with pytest.raises(SystemExit) as exc:
+        tla.main()
+    assert exc.value.code == 2
+    assert "--target-platform" in capsys.readouterr().err
 
 
 # A path — is_kernel_event strict cat == 'kernel'
@@ -996,7 +1012,7 @@ def _run_agent_route_to_a_skill_error(tmp_path, monkeypatch, capsys, skill_error
     monkeypatch.setattr(tla, "_gpu_arch_json", lambda *_args, **_kwargs: calls.append("arch"))
     monkeypatch.setattr(
         tla,
-        "_run_trace_split",
+        "run_trace_split",
         lambda *_args: (trace, {"chunks_extracted": 1, "chunks_by_mode": {}}),
     )
     monkeypatch.setattr(tla, "write_run_config", lambda **_kwargs: None)
@@ -1014,6 +1030,8 @@ def _run_agent_route_to_a_skill_error(tmp_path, monkeypatch, capsys, skill_error
             str(trace),
             "--workspace-path",
             str(tmp_path / "workspace"),
+            "--target-platform",
+            "MI355X",
             "--route",
             "agent",
         ],
@@ -1104,6 +1122,26 @@ def test_write_run_config_names_the_one_standalone_job(tmp_path, framework, capt
     assert job["trace_path"] == str(trace.resolve())
     assert job["platform"] == "MI300X"
     assert job.get("capture_folder") == (str(capture_dir.resolve()) if capture else None)
+
+
+@pytest.mark.parametrize(
+    ("framework", "discovered"),
+    [("vllm", True), ("custom", False)],
+)
+def test_a_capture_folder_is_discovered_only_for_the_mode_that_reads_one(tmp_path, framework, discovered):
+    """A custom profile has a capture_traces/ folder too, and naming it outside inference mode is refused."""
+    trace = tmp_path / "rank_0.trace.json.gz"
+    trace.touch()
+    capture = tmp_path / "capture_traces"
+    capture.mkdir()
+    # Hold a capture trace, so the mode is the only thing deciding: an empty folder is
+    # passed over by discovery itself, which is a separate rule with its own test.
+    (capture / "graph_capture_rank_0.json.gz").touch()
+    run = SimpleNamespace(args=SimpleNamespace(capture_folder=None, framework=framework), run_meta={})
+
+    found = tla._discovered_capture_folder(run, tmp_path, trace)
+
+    assert (found is not None) is discovered
 
 
 def test_124_run_tracelens_skill_uses_sdk_and_artifacts(tmp_path):
@@ -2219,7 +2257,7 @@ def test_scriptable_workload_with_a_capture_folder_fails_before_the_agent_starts
         raise AssertionError("the agent must not start on a rejected config")
 
     with (
-        patch.object(tla, "_run_trace_split", split_to_input),
+        patch.object(tla, "run_trace_split", split_to_input),
         patch.object(tla, "run_tracelens_skill", skill_must_not_run),
     ):
         _drive_main_over_capture_dir(
@@ -2254,7 +2292,7 @@ def test_the_non_llm_route_writes_the_same_artifacts_and_gates_on_the_report_sha
         return job.analysis_trace_path, {"chunks_extracted": 1, "chunks_by_mode": {}}
 
     with (
-        patch.object(tla, "_run_trace_split", split_to_input),
+        patch.object(tla, "run_trace_split", split_to_input),
         patch.object(tla, "analyze_perf_report", return_value=analysis),
     ):
         _drive_main_over_capture_dir(tmp_path, trace_dir)
@@ -2292,7 +2330,7 @@ def test_the_failed_status_keeps_the_skill_artifacts_when_a_later_step_raises(tm
         raise RuntimeError("render failed")
 
     with (
-        patch.object(tla, "_run_trace_split", split_to_input),
+        patch.object(tla, "run_trace_split", split_to_input),
         patch.object(tla, "run_tracelens_skill", skill_writes_report),
         patch.object(tla, "render_analysis_json", render_fails),
     ):
@@ -2356,7 +2394,7 @@ def test_a_route_with_no_located_kernel_source_records_kernel_source_unresolved(
         return job.analysis_trace_path, {"chunks_extracted": 1, "chunks_by_mode": {}}
 
     with (
-        patch.object(tla, "_run_trace_split", split_to_input),
+        patch.object(tla, "run_trace_split", split_to_input),
         patch.object(tla, "analyze_perf_report", return_value=analysis),
     ):
         _drive_main_over_capture_dir(tmp_path, trace_dir)

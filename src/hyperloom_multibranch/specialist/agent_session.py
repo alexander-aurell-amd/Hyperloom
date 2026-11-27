@@ -104,7 +104,7 @@ from hyperloom_multibranch.specialist.following import (
     reroot_requested,
 )
 from hyperloom_multibranch.specialist.judging import NOTICE, left_unjudged
-from hyperloom_multibranch.specialist.llm_usage import launch_cost, launch_usage
+from hyperloom_multibranch.specialist.llm_usage import launch_cost, launch_usage, tokens_beyond
 from hyperloom_multibranch.specialist.prompts import (
     IntegrationHeads,
     Resume,
@@ -280,7 +280,8 @@ class AgentSetup:
     ``readable`` are what every specialist of the session reads besides its worktree and workspace (the session's
     references, its model), and ``lease_area(branch)`` the directory the roots of ``branch``'s dev leases are made in;
     where a launch runs in a bubblewrap sandbox, those that exist are shown read-only, with the files the branch's
-    worktree links and its git metadata, and another branch's leases are not.
+    worktree links and its git metadata, and another branch's leases are not. ``profiled`` says whether the session's
+    server runs under a profiler, whose ranking the nudge of an idle turn then names.
     """
 
     command: AgentCommand
@@ -301,6 +302,7 @@ class AgentSetup:
     wait_wake_s: float = WAIT_WAKE_S
     readable: tuple[Path, ...] = ()
     lease_area: Callable[[str], Path] | None = None
+    profiled: bool = True
 
 
 class SessionBlackboard(BranchLogStore, UsageSink, Inbox, LearningStore, AgentRecords, LineageSink, Protocol):
@@ -330,6 +332,7 @@ class AgentSession:
         self._handle: AgentHandle | None = None
         self._beat: Beat | None = None
         self._recorded: Mapping[str, TokenCounts] = {}
+        self._launch_resumed = False
         self._requested: frozenset[str] = frozenset()
 
     async def preflight(self) -> None:
@@ -470,7 +473,7 @@ class AgentSession:
             await asyncio.to_thread(self._write_cli, launch.cli)
         spec = await asyncio.to_thread(self._spec, grant, launch)
         clock, started = self._setup.clock, self._setup.clock()
-        self._recorded = {}
+        self._recorded, self._launch_resumed = {}, launch.resumed
         if self._setup.command.interactive:
             launch.turns = TurnLog(self._place.workspace / PROCESS_LOG_NAME)
         handle = self._handle = await self._setup.runner.launch(spec)
@@ -595,7 +598,10 @@ class AgentSession:
             if strain >= _SILENT * len(waits):
                 raise await self._idle_end(handle, launch, quiet)
             try:
-                await self._setup.runner.send(handle, self._setup.command.message(message or nudge_message()).encode())
+                await self._setup.runner.send(
+                    handle,
+                    self._setup.command.message(message or nudge_message(profiled=self._setup.profiled)).encode(),
+                )
             except AgentEnded:
                 return await self._setup.runner.poll(handle)
             sent += 1
@@ -861,11 +867,9 @@ class AgentSession:
 
     async def _record_cost(self) -> None:
         """Record what the launch used since its last record."""
-        used = await asyncio.to_thread(launch_usage, self._place.workspace / PROCESS_LOG_NAME)
-        added = {
-            model: _less(counts, self._recorded.get(model, TokenCounts())) for model, counts in used.tokens.items()
-        }
-        added = {model: counts for model, counts in added.items() if counts != TokenCounts()}
+        log = self._place.workspace / PROCESS_LOG_NAME
+        used = await asyncio.to_thread(launch_usage, log, resumed=self._launch_resumed)
+        added = tokens_beyond(used.tokens, self._recorded)
         if not added:
             return
         self._recorded = used.tokens
@@ -1016,10 +1020,6 @@ class TurnLog:
             row.get("stop_reason", "")
         )
         self.context_exceeded = self.context_exceeded or (erred and too_long)
-
-
-def _less(counts: TokenCounts, earlier: TokenCounts) -> TokenCounts:
-    return TokenCounts(*(max(0, getattr(counts, item.name) - getattr(earlier, item.name)) for item in fields(counts)))
 
 
 def _describe(status: AgentStatus, seconds: float) -> str:

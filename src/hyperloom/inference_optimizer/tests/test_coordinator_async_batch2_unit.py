@@ -18,12 +18,9 @@ from types import SimpleNamespace
 import pytest
 
 from hyperloom.orchestrator.knowledge.knowledge_plane import KnowledgePlane
-from hyperloom.orchestrator.roles import (
-    Backend,
-    MockBackend,
-    ScriptedPlan,
-)
+from hyperloom.orchestrator.roles import Backend
 from hyperloom.orchestrator.roles.mcp_context_tools import ContextProvider, _make_handler
+from hyperloom.orchestrator.tests.mock_backend import MockBackend, ScriptedPlan
 from hyperloom.inference_optimizer.session.optimization_journal import Verdict
 from hyperloom.orchestrator.actions.executors.explore import STACK_REVALIDATE_SOURCE
 from hyperloom.orchestrator.loop.coordinator import Coordinator
@@ -33,8 +30,8 @@ from hyperloom.inference_optimizer.breakdown.stop_reasons import PATCH_RECOVERY_
 from hyperloom.orchestrator.loop._promote_outcome import IntegrateRecoveryIncomplete
 from hyperloom.orchestrator.state.task_registry import Task, TaskSpec
 from hyperloom.inference_optimizer.protocol.intent import Intent, IntentType
-from hyperloom.orchestrator.actions.executors import _patch_artifacts as patch_artifacts
-from hyperloom.orchestrator.actions.executors import _patch_sources as patch_sources
+from hyperloom.orchestrator.actions.executors.patching import _patch_artifacts as patch_artifacts
+from hyperloom.orchestrator.actions.executors.patching import _patch_sources as patch_sources
 from hyperloom.orchestrator.loop.verdicts import CriticRuling
 from hyperloom.orchestrator.phases import phase_transitions
 
@@ -517,7 +514,7 @@ async def test_resume_commits_the_reinstalled_source_layer_on_a_git_tree(coord: 
 @pytest.mark.asyncio
 async def test_a_candidate_after_resume_still_sees_the_kept_source_layer(coord: Coordinator, tmp_path: Path) -> None:
     from hyperloom.orchestrator.actions.executors._git import _git_head_sha
-    from hyperloom.orchestrator.actions.executors._patch_git import _git_reset_clean, _git_stash_if_dirty
+    from hyperloom.orchestrator.actions.executors.patching._patch_git import _git_reset_clean, _git_stash_if_dirty
 
     tree = _git_framework_tree(tmp_path)
     _resume_with_stack(coord, [_source_layer_entry(tmp_path, "kv_window", tree, {"envs.py": "patched envs\n"})])
@@ -985,7 +982,7 @@ def crashed_integrate_window(coord: Coordinator, pending_candidate):
     writes before the bus sees anything. ``outcome_status=None`` is the crash
     that happened first: the phase is on disk, the runner never finished.
     """
-    from hyperloom.orchestrator.actions.executors._patch_git import restore_pending_integrate
+    from hyperloom.orchestrator.actions.executors.patching._patch_git import restore_pending_integrate
     from hyperloom.orchestrator.state.shared_state import SharedState
 
     async def crash(*, keep: bool, outcome_status: str | None = None, cleanup_confirmed: bool = True):
@@ -1161,7 +1158,7 @@ def lost_execution_integrate(coord: Coordinator, pending_candidate, tmp_path: Pa
                 "task_id": candidate.task.task_id,
                 "state": "cancelled",
                 "result": {},
-                "error": "Operator confirmed the entire task process tree and remote workers/Ray actors stopped.",
+                "error": "Operator confirmed the entire task process tree and remote workers stopped.",
                 "error_class": "operator_confirmed_stopped",
             },
         }
@@ -1878,7 +1875,7 @@ async def test_resume_consistency_replays_pending_integrate_with_kept_result(coo
 
 @pytest.mark.asyncio
 async def test_resume_refuses_legacy_patch_without_task_evidence(coord: Coordinator, monkeypatch) -> None:
-    from hyperloom.orchestrator.actions.executors import _patch_git as patch_git
+    from hyperloom.orchestrator.actions.executors.patching import _patch_git as patch_git
 
     reversed_calls: list[str] = []
 
@@ -2026,22 +2023,6 @@ async def test_replay_for_resume_rebuilds_undecided_proposals(coord: Coordinator
     )
     await coord.writeback.replay_for_resume()
     assert list(coord.state.pending_proposals) == [p1.msg_id]
-
-
-@pytest.mark.asyncio
-async def test_replay_for_resume_verdict_map_backcompat(coord: Coordinator) -> None:
-    p1 = Message.new("kernel_agent", "orchestration", "proposal", {"action_name": "explore"})
-    await coord.bus.append_and_seq(p1)
-    await coord.bus.append_and_seq(
-        Message.new(
-            "critic",
-            "orchestration",
-            "review_verdict",
-            {"target_proposal_msg_id": p1.msg_id, "verdict_map": {"x": "ok"}},
-        )
-    )
-    await coord.writeback.replay_for_resume()
-    assert p1.msg_id not in coord.state.pending_proposals
 
 
 # -- _context_analysis_reader fallback (path read) --------------------------
@@ -2534,7 +2515,7 @@ async def test_advance_phase_escalation_transition(coord: Coordinator, monkeypat
 async def test_advance_phase_terminal_sets_stop_reason(coord: Coordinator, monkeypatch) -> None:
     import hyperloom.orchestrator.phases.machine_state as ps
 
-    coord.shared_state.phase = "SWEEP"
+    coord.shared_state.phase = "CYCLE_END"
     coord.shared_state.stop_reason = ""
     monkeypatch.setattr(
         phase_transitions, "compute_next_phase", lambda *a, **k: (ps.PHASE_CLOSE, "target_reached", {"terminal": True})
@@ -2555,7 +2536,7 @@ async def test_advance_phase_terminal_sets_stop_reason(coord: Coordinator, monke
         # Entering the phase whose exit reads the hint is no exception: the hint was emitted for the phase it was
         # emitted in, and carrying it across would end FRAMEWORK_AGENT on arrival.
         ("PRELUDE", "FRAMEWORK_AGENT", "prelude_done"),
-        ("FRAMEWORK_AGENT", "SWEEP", "some_other_reason"),
+        ("FRAMEWORK_AGENT", "CYCLE_END", "some_other_reason"),
     ],
 )
 async def test_advance_phase_hint_discarded_on_a_transition_it_did_not_drive(
@@ -2669,32 +2650,6 @@ def test_specialist_owner_is_frozen_at_creation_outside_agent_phases(
     assert explore_params["source_phase"] == "EXPLORE"
     assert coord.router._stamp_specialist_owner(framework_params) == "FRAMEWORK_AGENT"
     assert framework_params["source_phase"] == "FRAMEWORK_AGENT"
-
-
-@pytest.mark.asyncio
-async def test_materialize_explore_filters_grid(coord: Coordinator, monkeypatch) -> None:
-    coord.shared_state.baseline_tput = 800.0
-    monkeypatch.setattr(coord.proposals, "phase_framework", coord.phase_framework, raising=False)
-    pending = _pending(
-        "explore",
-        {
-            "params": {
-                "grid": [
-                    {"name": "v0"},
-                    {"name": "v1"},
-                    "non-dict-slot",
-                ]
-            }
-        },
-    )
-    await coord.proposals.materialize_approved_proposal(
-        pending,
-        approved_variant_names={"v0"},
-    )
-    tail = await coord.bus.tail(topic="decision", n=10)
-    assert any(m.payload.get("kind") == "approved_proposal" for m in tail)
-    task = await coord.tasks.get((await coord.tasks.queued())[0].task_id)
-    assert task.params["proposal_msg_id"] == pending.proposal_msg_id
 
 
 @pytest.mark.asyncio
@@ -2972,7 +2927,7 @@ async def test_on_enter_close_runs_full_sequence(coord: Coordinator, monkeypatch
 
     coord.shared_state.set_stop_reason("target_reached")
     await coord.phase_close.on_enter_close(
-        Transition(from_phase="SWEEP", to_phase="CLOSE", reason="SWEEP", evidence={})
+        Transition(from_phase="CYCLE_END", to_phase="CLOSE", reason="CYCLE_END", evidence={})
     )
     assert coord.shared_state.close_sequence_done is True
     assert coord.shared_state.stop_reason

@@ -98,7 +98,6 @@ class FakeRecipeStore:
         *,
         scheme: str,
         match: dict[str, str] | None = None,
-        hardware_in: list[str] | None = None,
         offset: int = 0,
         limit: int = 50,
     ) -> dict[str, Any]:
@@ -125,13 +124,12 @@ class FakeRecipeStore:
         }
         return {rel: f"kb://{canonical_id}/{session_id}/{rel}" for rel in self.uploads}
 
-    def put_knowledge(
+    def replace_knowledge(
         self,
         canonical_id: str,
+        session_id: str,
         knowledge: dict[str, Any],
         *,
-        session_id: str = "",
-        mode: str = "merge",
         scope: dict[str, Any] | None = None,
         objective_schema: str = "",
     ) -> dict[str, Any]:

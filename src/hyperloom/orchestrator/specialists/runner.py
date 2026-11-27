@@ -51,7 +51,7 @@ from .subprocess_ import SpecialistSubprocessConfig, SpecialistSubprocessDispatc
 from .subprocess_types import UNBOUNDED_REAP_CAP_SEC, SpecialistSpawn, SpecialistSubprocessResult
 from .worktrees import link_worktree
 from .patch_claims import grounding_explicit_root, patch_path_within_bases, resolve_claimed_patch, sibling_checkouts
-from . import patch_safety as _patch_safety
+from . import model_dirs, option_reviews, patch_safety as _patch_safety
 from .profile import MODE_PATCH, SpecialistProfile, resolve_specialist_profile
 from .prompt_inputs import SpecialistPromptInputs
 from hyperloom.inference_optimizer.tree_snapshot import snapshot_repository, snapshot_tree
@@ -215,7 +215,6 @@ def _workload_prompt_fields(params: dict[str, Any]) -> dict[str, Any]:
         "model_info": _param(params, "model_info", dict),
         "static_recon_checklist": _param(params, "static_recon_checklist", str),
         "enablement_source_context": _param(params, "enablement_source_context", str),
-        "enablement_candidate_refs": _param_texts(params, "enablement_candidate_refs"),
         "enablement_failure_signature": _param(params, "enablement_failure_signature", dict),
         "enablement_accepted_config": {
             "extra_envs": _param(params, "base_extra_envs", dict),
@@ -398,7 +397,7 @@ class SpecialistRunner:
         """
         params = ctx.task.params or {}
         domain_key = dispatch_domain_key(params)
-        gap = first_text(params.get("gap_canonical_id"), params.get("gap"))
+        gap = first_text(params.get("gap_canonical_id"))
         max_turns = resolve_specialist_max_turns(params.get("max_turns"), default=self.default_max_turns)
         domain = domain_for_tag(domain_key)
         profile = resolve_specialist_profile(params, domain=domain)
@@ -495,6 +494,7 @@ class SpecialistRunner:
             gap_symptom=_param(params, "gap_symptom", str),
             gap_layer=_param(params, "gap_layer", str),
             gap_evidence=_param(params, "gap_evidence", dict),
+            no_source_changes=bool(params.get("no_source_changes")),
             experience_kb_block=_param(params, "experience_kb_block", str),
             # Coordinator-populated roofline pre-fetch; empty when not warmed.
             roofline_evidence=_param(params, "roofline_evidence", dict),
@@ -726,9 +726,7 @@ class SpecialistRunner:
             agent=domain.key,
             attributes={"name": domain.key},
         ) as call_span:
-            # Ray-managed GPU execution: when the dispatcher acquired a GpuSpecialistLease, run the whole subprocess
-            # inside its num_gpus actor so any GPU command lands within Ray's assigned devices. ``None`` keeps the
-            # local path (``gpu_ids`` pinned into *_VISIBLE_DEVICES). A sandbox shows the model when it is a local path.
+            # A sandbox shows the model when it is a local path.
             sub_result: SpecialistSubprocessResult = await self.subprocess_dispatcher.run(
                 SpecialistSpawn(
                     task_id=ctx.task.task_id,
@@ -741,9 +739,8 @@ class SpecialistRunner:
                     disallowed_tools=SPECIALIST_TOOL_DENYLIST,
                     gpu_ids=tuple(ctx.extra.get("gpu_ids") or ()),
                     deadline=deadline,
-                    gpu_lease=ctx.extra.get("gpu_specialist_lease"),
                     progress_cb=ctx.extra.get("specialist_progress_cb"),
-                    readable=(Path(str((ctx.task.params or {}).get("model_path") or "")),),
+                    readable=await asyncio.to_thread(model_dirs.session_reads, self.session_dir, ctx.task.params),
                 )
             )
             call_status, call_attributes = _subprocess_call_outcome(sub_result)
@@ -899,7 +896,7 @@ class SpecialistRunner:
 
         Returns the audit notes the admission leaves for the result.
         """
-        notes: list[str] = []
+        notes = option_reviews.review_notes(self.session_dir, ctx.task, prep.profile.mode, done_payload)
         # Reconcile self-reported ``patches_written`` against the filesystem:
         # keep only claimed paths that exist on disk, then union with the scan.
         # Not when a harvested diff is the whole round, or the worktree was refused.
@@ -937,7 +934,6 @@ class SpecialistRunner:
         for proposal in done_payload.get("proposal_set") or []:
             if not isinstance(proposal, dict):
                 continue
-            # The dispatch scope feeds the Critic's cross-domain enrichment.
             proposal.setdefault("scope", prep.profile.scope)
             if "experience_citations" in proposal:
                 proposal["experience_citations"] = normalize_citations(proposal["experience_citations"], shown)
@@ -945,7 +941,7 @@ class SpecialistRunner:
             done_payload["experience_citations"] = normalize_citations(done_payload["experience_citations"], shown)
 
         # Universal patch-safety gate: drop non-diff/escaping patches, git-ground
-        # the rest, and scan for smuggled claims. Grounding is per set, not per
+        # the rest, and strip the forbidden fields. Grounding is per set, not per
         # patch, so the root below applies to all of them or to none.
         base_checkout = prep.worktree_base or prep.worktree
         vetted = _patch_safety.vet_patches(

@@ -28,7 +28,6 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from hyperloom_common.coerce import to_float as _float_or_none, to_int as _int_or_none, to_mapping as _as_dict
-from hyperloom.plugs import progress as _progress
 
 from .event_fields import now_iso_seconds as _now, text as _text
 from .event_ids import event_id
@@ -280,8 +279,7 @@ def record_proposal_review(review: ProposalReview) -> None:
     The row is located by reading back which phase event holds the proposal, not
     from the phase in scope: the Critic runs on its own tick and routinely rules
     after the raising phase has exited. A ruling for a proposal with no row is
-    dropped rather than minting one. ``effective_verdict`` is what was
-    committed, which the envelope validator can change.
+    dropped rather than minting one.
     """
     if not str(review.proposal_msg_id or ""):
         return
@@ -321,9 +319,6 @@ def record_settle(settlement: ActionSettlement) -> None:
     if not str(settlement.task_id or ""):
         return
     row = _action_row(str(settlement.task_id))
-    _progress.candidate_settled(
-        str(settlement.task_id), str((row or {}).get("action") or ""), str(settlement.decision or "")
-    )
     event = str(row["event_id"]) if row else None
     if event is None:
         return

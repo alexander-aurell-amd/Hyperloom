@@ -276,16 +276,23 @@ def test_cancel_during_boot_reaps_the_whole_tree(tmp_path):
     assert lifecycle.release() == server.Released(None, None, -signal.SIGTERM)
 
 
-@pytest.mark.parametrize("busy", [True, False])
+@pytest.mark.parametrize("busy", [True, False, "rss"])
 def test_a_silent_boot_is_working_while_its_processes_use_cpu(tmp_path, monkeypatch, busy):
     rig = _Rig(tmp_path, "silent")
     reads: list[int] = []
+    rss_reads: list[int] = []
 
     def cpu_sec(pid: int) -> float:
         reads.append(pid)
-        return 100.0 * len(reads) if busy else 1.0
+        return 100.0 * len(reads) if busy is True else 1.0
+
+    def rss_bytes(pid: int) -> dict[tuple[int, int], int]:
+        rss_reads.append(pid)
+        # CPU flat, resident memory growing: a rank pre-faulting a checkpoint mapped from a network filesystem.
+        return {(pid, 1): (watch.RSS_GROWTH_BYTES * 1000 * len(rss_reads)) if busy == "rss" else 1 << 30}
 
     monkeypatch.setattr(server, "tree_cpu_sec", cpu_sec)
+    monkeypatch.setattr(server, "tree_rss_bytes", rss_bytes)
     monkeypatch.setattr(watch, "CPU_SAMPLE_SEC", 0.05)
     stamped: list[float] = []
     write = RunLayout.write_boot_active_stamp
@@ -305,6 +312,7 @@ def test_a_silent_boot_is_working_while_its_processes_use_cpu(tmp_path, monkeypa
 
     layout = RunLayout(tmp_path / "r1")
     assert reads and len(set(reads)) == 1, "the CPU time read is the spawned server's"
+    assert set(rss_reads) == set(reads), "the resident memory read is the spawned server's"
     if busy:
         assert stopped == Stop(FailedStep.CANCELLED, "enough")
         # A watcher outside the round sees the boot only while the stamp keeps moving, in wall-clock seconds.
@@ -334,6 +342,28 @@ def test_a_taken_port_is_refused_before_spawning(tmp_path):
         stopped = rig.lifecycle(rig.config("r1")).acquire()
     assert isinstance(stopped, Stop) and stopped.step is FailedStep.PORT_IN_USE
     assert not rig.worker_file.exists()
+
+
+def _pinned(config: SuiteConfig, *cpus: int) -> SuiteConfig:
+    return replace(config, server=replace(config.server, cpus=cpus))
+
+
+def test_a_server_runs_on_the_cpus_its_config_names(tmp_path):
+    rig = _Rig(tmp_path)
+    cpu = min(os.sched_getaffinity(0))
+    lifecycle = rig.lifecycle(_pinned(rig.config("r1"), cpu))
+    assert isinstance(lifecycle.acquire(), Server)
+    try:
+        assert os.sched_getaffinity(rig.worker_pid()) == {cpu}
+    finally:
+        lifecycle.release()
+
+
+def test_cpus_the_server_cannot_run_on_are_refused_before_spawning(tmp_path):
+    rig = _Rig(tmp_path)
+    stopped = rig.lifecycle(_pinned(rig.config("r1"), min(os.sched_getaffinity(0)), 100_000)).acquire()
+    assert isinstance(stopped, Stop) and stopped.step is FailedStep.CONFIG_INVALID
+    assert "CPU 100000" in stopped.detail and not rig.worker_file.exists()
 
 
 @pytest.mark.parametrize("mode", [LifecycleMode.OWN, LifecycleMode.BOOT])

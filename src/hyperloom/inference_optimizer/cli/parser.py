@@ -49,7 +49,6 @@ from hyperloom_common.llm.llm_config import (
     DEFAULT_CLAUDE_MODEL,
     DEFAULT_CODEX_MODEL,
 )
-from hyperloom.orchestrator.scoring.proposal_scorer import DEFAULT_SCORER_MODELS
 
 #: Fallback wall-clock budget. Named because ``--resume-from`` reads it back as
 #: the "operator did not set this" signal: unlike the target flags, this one has
@@ -218,42 +217,6 @@ def _add_resume_arguments(opt: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_plug_arguments(opt: argparse.ArgumentParser) -> None:
-    """Add the flags that select which implementation fills each plug socket; absent, every socket stays local."""
-    opt.add_argument(
-        "--plug-profile",
-        dest="plug_profile",
-        default=None,
-        metavar="NAME",
-        help="Built-in plug profile to load (local, hosted-gpu, hosted-cpu). Without it, and without the other plug "
-        "flags, nothing changes from a plain local run.",
-    )
-    opt.add_argument(
-        "--manifest",
-        dest="plug_manifest",
-        default=None,
-        metavar="PATH",
-        help="Custom plug manifest (JSON) laid over the profile. Falls back to $HYPERLOOM_MANIFEST.",
-    )
-    for flag, dest, metavar, text in (
-        (
-            "--plug",
-            "plug",
-            "SOCKET=IMPL",
-            "Choose the implementation of one socket; repeatable. The last layer, over profile, manifest and "
-            "$HYPERLOOM_MANIFEST_OVERRIDES.",
-        ),
-        (
-            "--plug-config",
-            "plug_config",
-            "SOCKET.KEY=VALUE",
-            "Set one configuration key of a socket's implementation; repeatable. VALUE is read as JSON when it "
-            "parses as JSON, as text otherwise.",
-        ),
-    ):
-        opt.add_argument(flag, dest=dest, action="append", default=[], metavar=metavar, help=text)
-
-
 def _add_model_arguments(opt: argparse.ArgumentParser) -> None:
     """Add the model path and quantization-prelude flags of ``optimize``."""
     opt.add_argument(
@@ -402,7 +365,7 @@ def _add_model_context_arguments(opt: argparse.ArgumentParser) -> None:
             "Categorical model-class key. It is the deterministic key for "
             "several consumers: the atom explore seed grid "
             "(action_executors/explore.py), the framework-agent gap search "
-            "token (action_executors/_framework_gap_composer.py), the recipe "
+            "token (action_executors/framework_change/_framework_gap_composer.py), the recipe "
             "key, and the orchestration prompt label. Recognised values "
             "(case-insensitive, with -/+/space tolerated): dense / moe_mla / "
             "moe_swa / moe_mla_nsa. When unset, Coordinator boot infers and "
@@ -473,37 +436,6 @@ def _add_capacity_arguments(opt: argparse.ArgumentParser) -> None:
     )
 
 
-def _add_proposal_scorer_arguments(opt: argparse.ArgumentParser) -> None:
-    """Add the advisory proposal-scorer flags of ``optimize``."""
-    # Advisory specialist-proposal scorer (ProposalScorer): scores each proposal_set with gateway models as a
-    # reference for Orchestration; never gates.
-    opt.add_argument(
-        "--proposal-scorer-models",
-        dest="proposal_scorer_models",
-        type=str,
-        default=",".join(DEFAULT_SCORER_MODELS),
-        help="Comma-separated gateway model slugs that independently "
-        "score each specialist proposal_set (advisory only; never "
-        "gates; rater identities are anonymized in the orchestration "
-        "prompt). Only takes effect when --proposal-scoring is also "
-        "passed (scoring is OFF by default); this flag alone does not "
-        "enable scoring. Default '%(default)s'. "
-        "Add a model by appending its slug. Empty list disables scoring "
-        "even when enabled.",
-    )
-    opt.add_argument(
-        "--proposal-scoring",
-        dest="proposal_scoring",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Enable the advisory specialist-proposal scorer (disabled by "
-        "default). Use --no-proposal-scoring to keep it off explicitly. "
-        "Even when enabled it is skipped in Anthropic-only deployments "
-        "(OpenAI-compatible only) or when the model list is empty. "
-        "Advisory only; never gates.",
-    )
-
-
 def _add_specialist_arguments(opt: argparse.ArgumentParser) -> None:
     """Add the specialist model, turn-cap and MCP-config flags of ``optimize``."""
     from hyperloom.orchestrator.specialists.domains import (
@@ -564,7 +496,6 @@ def _build_parser() -> argparse.ArgumentParser:
     add_constraint_arguments(opt)
     add_gpu_power_arguments(opt)
     _add_resume_arguments(opt)
-    _add_plug_arguments(opt)
     _add_model_context_arguments(opt)
     add_run_mode_arguments(opt)
     add_framework_agent_arguments(opt)
@@ -573,7 +504,6 @@ def _build_parser() -> argparse.ArgumentParser:
     add_kb_arguments(opt)
     add_service_arguments(opt)
     _add_capacity_arguments(opt)
-    _add_proposal_scorer_arguments(opt)
     _add_specialist_arguments(opt)
     add_research_arguments(opt)
     add_recon_arguments(opt)

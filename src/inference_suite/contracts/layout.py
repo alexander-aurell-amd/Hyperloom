@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: 2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: MIT
 
-"""The run_dir layout: every file a round leaves, by name, and the ``server_ready_at`` stamp's format.
+"""The run_dir layout: every file a round leaves, by name, the ``server_ready_at`` stamp's format, and how
+``profile/capture.json`` tells a control request the server refused from one it never answered.
 
 One round writes one run_dir and leaves it unchanged once the round ends. Readers locate files through
 :class:`RunLayout` rather than spelling names or globbing. ``gpu_metrics.json`` is not in the run_dir: the host
@@ -20,8 +21,9 @@ LAUNCH_FILE = "launch.json"
 REPORT_FILE = "report.json"
 SERVER_LOG = "server.log"
 READY_STAMP = "server_ready_at"
-#: The wall-clock second a booting server's processes were last seen using at least a quarter of a CPU, for a watcher
-#: outside the round that sees only the run_dir.
+#: The wall-clock second a booting server's processes were last seen making progress without a log line: using at least
+#: a quarter of a CPU, or growing their resident memory or the bytes they read by at least 64 MiB per 10 s. For a
+#: watcher outside the round that sees only the run_dir.
 BOOT_ACTIVE_STAMP = "server_boot_active_at"
 SERVER_PID = "server.pid"
 PHASE_MARKS = "phase_marks.json"
@@ -29,6 +31,8 @@ KV_METRICS = "kv_metrics.json"
 AGENTX_TIMELINE = "agentx_timeline.jsonl"
 POWER = "power.json"
 GPU_METRICS = "gpu_metrics.json"
+#: What the checkpoint prefetch of a booting server did (:mod:`hyperloom_common.weight_prefetch`); only when it was on.
+WEIGHT_PREFETCH = "weight_prefetch.json"
 #: Files a host writes from the run_dir into its own round directory; never inside a run_dir.
 HOST_DERIVED = (GPU_METRICS,)
 
@@ -43,6 +47,8 @@ CAPTURE_TRACE_DIRS = (CAPTURE_TRACES_DIR, GRAPH_CAPTURE_DIR)
 #: The profiler's trace subdirectories, kept apart rather than flattened so a reader tells a step from a sidecar.
 PROFILE_TRACE_DIRS = (TORCH_TRACE_DIR, *CAPTURE_TRACE_DIRS)
 _UTF8 = "utf-8"
+#: How urllib words the error of a request the server answered with an error status.
+_ANSWERED_WITH_STATUS = "HTTP Error "
 
 
 @dataclass(frozen=True)
@@ -79,6 +85,12 @@ def parse_ready_stamp(text: str) -> ReadyStamp | None:
         return ReadyStamp(float(fields[0]), float(fields[1]))
     except ValueError:
         return None
+
+
+def answered_with_status(error: str) -> bool:
+    """Whether ``error``, a profile control request's error as ``profile/capture.json`` records it
+    (``<path>: <cause>``), is the server's answer with an error status rather than no answer."""
+    return error.partition(": ")[2].startswith(_ANSWERED_WITH_STATUS)
 
 
 class RunDirError(ValueError):
@@ -137,6 +149,10 @@ class RunLayout:
     @property
     def kv_metrics(self) -> Path:
         return self.root / KV_METRICS
+
+    @property
+    def weight_prefetch(self) -> Path:
+        return self.root / WEIGHT_PREFETCH
 
     @property
     def agentx_timeline(self) -> Path:
@@ -277,9 +293,11 @@ __all__ = [
     "SERVER_LOG",
     "SERVER_PID",
     "TORCH_TRACE_DIR",
+    "WEIGHT_PREFETCH",
     "ReadyStamp",
     "RunDirError",
     "RunLayout",
+    "answered_with_status",
     "format_ready_stamp",
     "parse_ready_stamp",
 ]

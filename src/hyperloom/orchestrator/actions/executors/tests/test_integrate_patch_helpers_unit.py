@@ -11,10 +11,10 @@ import pytest
 
 from hyperloom.orchestrator.actions.executors import _git as gitmod
 from hyperloom.orchestrator.actions.executors import integrate_patch as ip
-from hyperloom.orchestrator.actions.executors import _integrate_enablement_gate as integrate_enablement_gate
-from hyperloom.orchestrator.actions.executors import _patch_git as patch_git
-from hyperloom.orchestrator.actions.executors import _patch_sources as patch_sources
-from hyperloom.orchestrator.actions.executors import _integrate_refusals as integrate_refusals
+from hyperloom.orchestrator.actions.executors.integrate import _integrate_enablement_gate as integrate_enablement_gate
+from hyperloom.orchestrator.actions.executors.patching import _patch_git as patch_git
+from hyperloom.orchestrator.actions.executors.patching import _patch_sources as patch_sources
+from hyperloom.orchestrator.actions.executors.integrate import _integrate_refusals as integrate_refusals
 from hyperloom.orchestrator.tests._helpers import git_repo_tracking
 
 
@@ -76,15 +76,15 @@ def test_resolve_framework_root_explicit_dir(tmp_path):
     assert patch_sources._resolve_framework_root(str(tmp_path)) == tmp_path
 
 
-def test_recorded_roots_with_external_localization_require_full_resolution(tmp_path):
+def test_recorded_roots_with_a_patch_outside_the_workspace_require_full_resolution(tmp_path):
     workspace = tmp_path / "specialist"
     workspace.mkdir()
     authored = workspace / "authored.patch"
     authored.touch()
-    localization = tmp_path / "localization.patch"
-    localization.touch()
-    payload = {"patch_roots": {str(authored): "/aiter", str(localization): "/aiter"}}
-    assert patch_sources._sole_patch_root(payload, [authored, localization], specialist_workspace=workspace) is None
+    outside = tmp_path / "outside.patch"
+    outside.touch()
+    payload = {"patch_roots": {str(authored): "/aiter", str(outside): "/aiter"}}
+    assert patch_sources._sole_patch_root(payload, [authored, outside], specialist_workspace=workspace) is None
 
 
 def test_recorded_root_with_nul_declines_fast_path(tmp_path):
@@ -729,7 +729,7 @@ def test_harvest_realized_diff_reads_the_keep_commit(tmp_path):
     """The KEEP is already committed, so its own commit is the realized change."""
     import subprocess as sp
 
-    from hyperloom.orchestrator.actions.executors._patch_snapshot import harvest_realized_diff
+    from hyperloom.orchestrator.actions.executors.patching._patch_snapshot import harvest_realized_diff
 
     root = tmp_path / "framework"
     root.mkdir()
@@ -749,7 +749,7 @@ def test_harvest_realized_diff_reads_the_keep_commit(tmp_path):
 
 
 def test_harvest_realized_diff_returns_empty_without_a_change(tmp_path):
-    from hyperloom.orchestrator.actions.executors._patch_snapshot import harvest_realized_diff
+    from hyperloom.orchestrator.actions.executors.patching._patch_snapshot import harvest_realized_diff
 
     root = tmp_path / "framework"
     root.mkdir()
@@ -760,7 +760,7 @@ def test_harvest_realized_diff_returns_empty_without_a_change(tmp_path):
 
 
 def test_harvest_realized_diff_returns_empty_outside_git(tmp_path):
-    from hyperloom.orchestrator.actions.executors._patch_snapshot import harvest_realized_diff
+    from hyperloom.orchestrator.actions.executors.patching._patch_snapshot import harvest_realized_diff
 
     plain = tmp_path / "plain"
     plain.mkdir()

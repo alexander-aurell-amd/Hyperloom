@@ -56,8 +56,8 @@ skip the user-approval step (#1314).
 Suggested Docker images:
 
 - `vllm`: `docker.io/vllm/vllm-openai-rocm:v0.34.0-rocm100`
-- `sglang` MI300X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi30x-20261118`
-- `sglang` MI355X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261118`
+- `sglang` MI300X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi30x-20261111`
+- `sglang` MI355X: `docker.io/lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111`
 
 In Docker mode, start a long-running container on `HYPERLOOM_DOCKER_TARGET_HOST`
 (or the current host when it is unset) before running setup or optimize:
@@ -121,7 +121,7 @@ Collect these required values:
   `MAX_MODEL_LEN` / `PROFILE_OSL`.
 - Objective and budget: `MAX_HOURS` plus `TARGET_GAIN`.
 - Optional phase budget percentages for `PRELUDE`, `FRAMEWORK_AGENT`,
-  `KERNEL_AGENT`, `SWEEP`, and `CLOSE`.
+  `KERNEL_AGENT`, and `CLOSE`.
 
 ## Default Values
 
@@ -148,9 +148,8 @@ resolved values in the launch plan before starting the optimizer.
 - `SKIP_VARIANTS`: empty.
 - `SERVER_ARGS`: empty.
 - `REFERENCE_SCRIPT`: unset.
-- `CONC_SWEEP_CONCS`: unset, so Hyperloom uses its default sweep ladder.
-- `CONC_SWEEP_TOTAL_BUDGET_SEC`: unset, so Hyperloom uses its default total
-  sweep budget. This bounds the whole sweep, not a single benchmark spawn.
+- `CONC_SWEEP_CONCS`: unset; the post-session concurrency sweep takes its points from the InferenceX recipe, and
+  reads this only for an operator `REFERENCE_SCRIPT`.
 - Phase budget percentages default to:
   - `PHASE_BUDGET_PRELUDE_PCT=0.03`: startup, preflight, baseline setup, and
     initial orchestration.
@@ -158,12 +157,10 @@ resolved values in the launch plan before starting the optimizer.
     search and source/upstream landing, with benchmark validation.
   - `PHASE_BUDGET_KERNEL_PCT=0.50`: kernel-agent TraceLens/GEAK/native-kernel
     optimization work.
-  - `PHASE_BUDGET_SWEEP_PCT=0.05`: concurrency sweep and final throughput
-    validation around the best candidate.
   - `PHASE_BUDGET_CLOSE_PCT=0.02`: final report, state closeout, and summary
     generation.
 - Phase toggles default to enabled: kernel, framework agent, framework local
-  exploration, roofline, and concurrency sweep.
+  exploration, roofline, and the post-session concurrency sweep.
 
 Collect these optional advanced values:
 
@@ -172,15 +169,13 @@ Collect these optional advanced values:
   `--no-enable-roofline`.
 - Phase budget percentages:
   `PHASE_BUDGET_PRELUDE_PCT`, `PHASE_BUDGET_FRAMEWORK_PCT`,
-  `PHASE_BUDGET_KERNEL_PCT`,
-  `PHASE_BUDGET_SWEEP_PCT`, and `PHASE_BUDGET_CLOSE_PCT`.
+  `PHASE_BUDGET_KERNEL_PCT`, and `PHASE_BUDGET_CLOSE_PCT`.
   Explain what each phase does before asking. Accept only values where
   `0 < pct <= 1`; leave a value unset to use the optimizer default.
 - Routing and baseline options: `--skip-variants`, `--server-args`,
   `--reference-script`, `--model-class`, `--gpu-type`, `--framework-version`,
   `--compare-against-gpu`.
-- Concurrency sweep: `--conc-sweep-concs` and `--conc-sweep-total-budget-sec`
-  (the total budget across the sweep).
+- Concurrency sweep: `--conc-sweep-concs`.
 - Benchmark limits: `INFERENCE_OPTIMIZER_BENCHMARK_TIMEOUT_SEC` (default `7800`
   seconds per actual spawn, including boot and accuracy) and
   `INFERENCE_OPTIMIZER_BENCHMARK_SILENCE_TIMEOUT_SEC` (default `600` seconds,
@@ -192,8 +187,9 @@ Guardrails:
 
 - Do not rely on `.env` alone for `TP`, `CONC`, `ISL`, `OSL`, or `PRECISION`;
   pass explicit CLI flags in the optimize command.
-- Omit `--gpu-type` unless the user explicitly chooses a hint; otherwise let
-  Hyperloom auto-detect from ROCm/system info.
+- Omit `--gpu-type` unless the user names the GPU; Hyperloom takes the label
+  of the card the machine reports, and uses a given name only when the card
+  reports no model name.
 - `--no-framework-agent` skips the entire OPTIMIZE phase (PRELUDE goes straight
   to KERNEL_AGENT), dropping both of its arms: upstream-PR landing and local
   source authoring. Warn before applying it; combined with `--no-kernel` it
@@ -254,7 +250,7 @@ PY
 
 Before the first `optimize` launch, run the full runtime installer in the same
 environment that will launch the optimizer. Preflight loads `kernel-agent.env.sh`
-before it can reach the later Ray and benchmark-client auto-install checks, so this
+before it can reach the later benchmark-client auto-install checks, so this
 step must happen before launching.
 
 For Docker mode, run this inside the container. For bare-metal mode, run it on
@@ -267,7 +263,6 @@ load_dotenv_no_clobber
 : "${USER_DATA_PATH:?USER_DATA_PATH missing}"
 export USER_DATA_PATH
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
-ulimit -Sn 65536 || true
 bash "$INSTALL_SH"
 ```
 
@@ -309,7 +304,6 @@ export TARGET_GAIN="${TARGET_GAIN:-30}"
 export PHASE_BUDGET_PRELUDE_PCT="${PHASE_BUDGET_PRELUDE_PCT:-}"
 export PHASE_BUDGET_FRAMEWORK_PCT="${PHASE_BUDGET_FRAMEWORK_PCT:-}"
 export PHASE_BUDGET_KERNEL_PCT="${PHASE_BUDGET_KERNEL_PCT:-}"
-export PHASE_BUDGET_SWEEP_PCT="${PHASE_BUDGET_SWEEP_PCT:-}"
 export PHASE_BUDGET_CLOSE_PCT="${PHASE_BUDGET_CLOSE_PCT:-}"
 
 OPT_FLAGS=(
@@ -337,11 +331,9 @@ OPT_FLAGS=(
 [ -n "${SERVER_ARGS:-}" ] && OPT_FLAGS+=(--server-args "$SERVER_ARGS")
 [ -n "${REFERENCE_SCRIPT:-}" ] && OPT_FLAGS+=(--reference-script "$REFERENCE_SCRIPT")
 [ -n "${CONC_SWEEP_CONCS:-}" ] && OPT_FLAGS+=(--conc-sweep-concs "$CONC_SWEEP_CONCS")
-[ -n "${CONC_SWEEP_TOTAL_BUDGET_SEC:-}" ] && OPT_FLAGS+=(--conc-sweep-total-budget-sec "$CONC_SWEEP_TOTAL_BUDGET_SEC")
 [ -n "${PHASE_BUDGET_PRELUDE_PCT:-}" ] && OPT_FLAGS+=(--phase-budget-prelude-pct "$PHASE_BUDGET_PRELUDE_PCT")
 [ -n "${PHASE_BUDGET_FRAMEWORK_PCT:-}" ] && OPT_FLAGS+=(--phase-budget-framework-pct "$PHASE_BUDGET_FRAMEWORK_PCT")
 [ -n "${PHASE_BUDGET_KERNEL_PCT:-}" ] && OPT_FLAGS+=(--phase-budget-kernel-pct "$PHASE_BUDGET_KERNEL_PCT")
-[ -n "${PHASE_BUDGET_SWEEP_PCT:-}" ] && OPT_FLAGS+=(--phase-budget-sweep-pct "$PHASE_BUDGET_SWEEP_PCT")
 [ -n "${PHASE_BUDGET_CLOSE_PCT:-}" ] && OPT_FLAGS+=(--phase-budget-close-pct "$PHASE_BUDGET_CLOSE_PCT")
 [ "${NO_KERNEL:-0}" = "1" ] && OPT_FLAGS+=(--no-kernel)
 [ "${NO_FRAMEWORK_AGENT:-0}" = "1" ] && OPT_FLAGS+=(--no-framework-agent)

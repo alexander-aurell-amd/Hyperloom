@@ -20,13 +20,14 @@ from hyperloom.common.env_safety import redact_secret_values
 from hyperloom.inference_optimizer.breakdown.recorder.baseline_event import BaselineInvocation
 from hyperloom.inference_optimizer.trace.task_progress import heartbeat_while_output_flows
 from inference_suite.contracts import FailedStep, LifecycleMode
-from .._grid_runner import sanitize_result_dir, sanitize_script_name
-from .._launch_evidence import RequestedLaunch, build_launch_evidence, persist_measurement_evidence
-from .._workload_envs import (
+from ..grid._grid_inputs import sanitize_result_dir, sanitize_script_name
+from ..workload._launch_evidence import RequestedLaunch, build_launch_evidence, persist_measurement_evidence
+from ..workload._workload_envs import (
     BenchmarkTarget,
     FrameworkScriptMismatchError,
     LaunchLayer,
     MaterializeOptions,
+    PromptDatasetError,
     materialize_benchmark_config,
 )
 from ..benchmark_result import (
@@ -113,10 +114,10 @@ def _attach_baseline_launch_evidence(
     framework: str,
 ) -> None:
     """Persist the declared and observed server identity, and its runtime findings, for a baseline result."""
-    from .._grid_runner import _measurement_server_log_path
+    from ..grid._round_report import measurement_server_log_path
 
     workspace = Path(str(result.get("workspace") or "")) if result.get("workspace") else None
-    actual_log = _measurement_server_log_path(output_dir / "server.log", workspace, slot=output_dir)
+    actual_log = measurement_server_log_path(output_dir / "server.log", workspace, slot=output_dir)
     result["server_log_path"] = actual_log or ""
     evidence = build_launch_evidence(
         RequestedLaunch(config_path, framework), actual_server_log=actual_log, slot=output_dir
@@ -158,15 +159,14 @@ def _attempt_target(params: dict[str, Any], resolved_model: str, override_script
     )
 
 
-def _attempt_options(ctx: RunnerContext, shared_state: Any, drop_moe_runner_backend: bool) -> MaterializeOptions:
-    """How the attempt's config is materialized: quality-reference role, MoE-runner drop, FlyDSL, AgentX, grading."""
+def _attempt_options(ctx: RunnerContext, shared_state: Any) -> MaterializeOptions:
+    """How the attempt's config is materialized: quality-reference role, FlyDSL, AgentX, grading."""
     params = ctx.task.params
     return MaterializeOptions(
         # Only a genuine ``baseline`` task may establish/overwrite the quality reference;
         # ``replay_warm_recipe`` reuses this executor but must compare against the pure baseline reference
         # rather than redefine it.
         establish_quality_ref=_should_establish_quality_ref(getattr(ctx.task, "kind", ""), params),
-        drop_moe_runner_backend=drop_moe_runner_backend,
         flydsl_source_dirs=is_truthy(params.get("flydsl_source_dirs")),
         agentx_mode=agentx_active(benchmark_mode=getattr(shared_state, _BENCHMARK_MODE_ATTR, "")),
         grading=getattr(shared_state, "grading", None),
@@ -204,23 +204,12 @@ def _suite_round_failure(
 class _BenchmarkLaunchMixin:
     """Attempt setup and the measured round's result of a benchmark run."""
 
-    async def _run_once(
-        self,
-        ctx: RunnerContext,
-        *,
-        force_drop_moe_runner_backend: bool = False,
-        recorder: Any = None,
-        run_index: int = 0,
-    ) -> dict[str, Any]:
+    async def _run_once(self, ctx: RunnerContext, *, recorder: Any = None) -> dict[str, Any]:
         """Resolve what this baseline attempt runs with, write its config, and run its rounds."""
         params = ctx.task.params
         config_path = self._attempt_config_path(params)
         shared_state = ctx.extra.get("shared_state") or self.shared_state
-        fw, server_args = self._settle_attempt_server_args(
-            params,
-            shared_state,
-            drop_moe_runner_backend=force_drop_moe_runner_backend,
-        )
+        fw, server_args = self._settle_attempt_server_args(params, shared_state)
         output_dir = self._resolve_workspace(ctx, "baseline")
         output_dir.mkdir(parents=True, exist_ok=True)
         # Orchestration-supplied script + result_dir overrides.
@@ -243,21 +232,20 @@ class _BenchmarkLaunchMixin:
                 output_dir,
                 launch=_attempt_launch_layer(params, server_args, base_extra_envs),
                 target=_attempt_target(params, resolved_model, override_script),
-                options=_attempt_options(ctx, shared_state, force_drop_moe_runner_backend),
+                options=_attempt_options(ctx, shared_state),
             )
-        except (FrameworkScriptMismatchError, ServerArgvInvalidError) as exc:
+        except (FrameworkScriptMismatchError, PromptDatasetError, ServerArgvInvalidError) as exc:
             return _attempt_failure(getattr(exc, "error_class", "framework_script_mismatch"), exc, output_dir)
         from ..agentx_point import activate_runtime
 
         activate_runtime(config_path, params.get("runtime_override") or {})
         # Report the invocation now, with the config final and the server not
         # yet booted. This frame is the only one that knows the args as a fact:
-        # the one-shot eager fallback and the MoE-runner drop have both had
-        # their say by here, and after the launch the same answer can only be
-        # guessed at by parsing the server's own log back.
+        # the one-shot eager fallback has had its say by here, and after the
+        # launch the same answer can only be guessed at by parsing the server's
+        # own log back.
         if recorder is not None:
             recorder.record_invocation(
-                run_index=run_index,
                 invocation=BaselineInvocation(
                     framework_args=server_args,
                     extra_envs=base_extra_envs,
@@ -278,7 +266,6 @@ class _BenchmarkLaunchMixin:
                 params=params,
                 ctx=ctx,
                 recorder=recorder,
-                run_index=run_index,
             ),
             output_dir,
         )
@@ -305,7 +292,7 @@ class _BenchmarkLaunchMixin:
         resolved_model: str,
     ) -> dict[str, Any] | None:
         from .._multi_node_env import round_server_env
-        from .._multi_node_server_lifecycle import RoundServer, ServerRestartFailed, restart_server_for_round
+        from ..serving._multi_node_server_lifecycle import RoundServer, ServerRestartFailed, restart_server_for_round
 
         if round_.ctx_extra.get("mn_round_restarted"):
             return None
@@ -356,7 +343,6 @@ class _BenchmarkLaunchMixin:
             lifecycle=round_lifecycle(round_.output_dir, mode),
             warmup=warmup,
             deadline_unix=deadline_unix(round_.session_deadline_sec),
-            serving_lease=round_.serving_lease,
         )
         attempt_index = open_bringup_attempt(round_.output_dir)
         started_unix = time.time()

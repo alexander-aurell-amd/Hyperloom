@@ -11,8 +11,10 @@ trace: no card and no model. The PR search runs against a GitHub that answers fr
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import gzip
 import json
+import logging
 import os
 import secrets
 import threading
@@ -24,8 +26,8 @@ from typing import Any
 
 import pytest
 
-from hyperloom_common.gpu_identity import AMD_GPU_BOARDS
 from hyperloom.hosted.mcp_server import McpServer, McpServerConfig
+from hyperloom.orchestrator.tests._fixtures import MI355X_CARD, publish_card
 from hyperloom_multibranch.contracts.blackboard import Role, Writer
 from hyperloom_multibranch.contracts.toolbox import RequestRejected
 from hyperloom_multibranch.blackboard import LocalBlackboard
@@ -45,6 +47,8 @@ SGLANG = "https://github.com/sgl-project/sglang"
 GITHUB_API = "https://api.github.com/"
 _REAL_URLOPEN = urllib.request.urlopen
 HOST_TOKEN = "ghp_host_token_not_for_the_result"
+#: The GPU label the session exports as ``GPU_TYPE``.
+SESSION_LABEL = "mi355x"
 #: One serving step: TraceLens' perf report links a kernel (on the GPU's pid) to its op through the launch's correlation
 #: and ``External id``.
 STEP = [
@@ -118,16 +122,23 @@ class _Response:
 
 
 class Github:
-    """The search endpoint of GitHub; ``failing`` is the error it raises, ``answer`` what it returns instead of the items.
+    """The search endpoint of GitHub; ``failing`` is the error it raises, ``answer`` what it returns instead of the items,
+    ``matched`` the pull requests it says matched when that is more than the items.
 
     Every request is kept, with the process and thread that made it and the ``Authorization`` it carried. A request to
     anything else (the test's own calls to the MCP server) goes through.
     """
 
     def __init__(
-        self, items: list[dict[str, Any]] | None = None, *, failing: Exception | None = None, answer: Any = None
+        self,
+        items: list[dict[str, Any]] | None = None,
+        *,
+        failing: Exception | None = None,
+        answer: Any = None,
+        matched: int | None = None,
     ) -> None:
         self.items, self.failing, self.answer = items or [], failing, answer
+        self.matched = len(self.items) if matched is None else matched
         self.requests: list[tuple[str, str | None, int, str]] = []
 
     def __call__(self, request: urllib.request.Request, timeout: float | None = None) -> Any:
@@ -137,13 +148,11 @@ class Github:
         self.requests.append((url, request.get_header("Authorization"), os.getpid(), threading.current_thread().name))
         if self.failing is not None:
             raise self.failing
-        return _Response(
-            self.answer if self.answer is not None else {"total_count": len(self.items), "items": self.items}
-        )
+        return _Response(self.answer if self.answer is not None else {"total_count": self.matched, "items": self.items})
 
 
-def _http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("https://api.github.com/x", code, "refused", {}, None)  # type: ignore[arg-type]
+def _http_error(code: int, **headers: str) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://api.github.com/x", code, "refused", headers, None)  # type: ignore[arg-type]
 
 
 def _pr(number: int, title: str) -> dict[str, Any]:
@@ -152,8 +161,8 @@ def _pr(number: int, title: str) -> dict[str, Any]:
 
 @pytest.fixture(autouse=True)
 def _host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """A TraceLens checkout that is only a directory with a ``.git`` (the non-llm analysis does not read it), and a host that
-    holds a GitHub token."""
+    """A TraceLens checkout that is only a directory with a ``.git`` (the non-llm analysis does not read it), a session
+    that exports its GPU label, and a host that holds a GitHub token."""
     (tmp_path / "TraceLens" / ".git").mkdir(parents=True)
     skill = (
         tmp_path / "TraceLens" / "TraceLens" / "Agent" / "Analysis" / "skills" / "analysis-orchestrator" / "SKILL.md"
@@ -162,6 +171,7 @@ def _host(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     skill.write_text("the agent route's skill; the non-llm route only checks it is there\n", encoding="utf-8")
     monkeypatch.setenv("TRACELENS_ROOT", str(tmp_path / "TraceLens"))
     monkeypatch.delenv("HYPERLOOM_TRACE_ANALYSIS_ROUTE", raising=False)
+    monkeypatch.setenv("GPU_TYPE", SESSION_LABEL)
     monkeypatch.setenv("GITHUB_TOKEN", HOST_TOKEN)
     monkeypatch.delenv("GH_TOKEN", raising=False)
 
@@ -275,17 +285,26 @@ async def _never(payload: dict, *, session_dir: Path) -> dict:
     raise AssertionError("the analysis must not start")
 
 
-async def test_a_specialist_gets_the_roofline_of_the_trace_its_profile_test_left(served: Local) -> None:
+@pytest.fixture
+def mi355x_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The session published an MI355X as its card."""
+    publish_card(monkeypatch, MI355X_CARD)
+
+
+@pytest.mark.usefixtures("mi355x_session")
+async def test_a_specialist_gets_the_roofline_of_the_trace_its_profile_test_left_for_the_sessions_gpu(
+    served: Local,
+) -> None:
     status, record = await _roofline(served, TRACE)
     result = record["result"]
     assert status is JobStatus.SUCCEEDED and record["summary"] == "roofline analysed"
-    assert (result["status"], result["analysis_meta"]["route"], _analysed_platform(result)) == (
+    assert (result["status"], result["analysis_meta"]["route"], _analysed_platform(result).upper()) == (
         "ok",
         "non-llm",
-        "MI355X",
+        SESSION_LABEL.upper(),
     )
-    # TraceLens bundles no MI355X: its report read Hyperloom's peaks for the board.
-    assert _arch_used(result)["mem_bw_gbps"] == AMD_GPU_BOARDS["mi355x"].hbm_bw_gbps
+    # TraceLens bundles no MI355X: its report read the vendor peaks of the session's card.
+    assert _arch_used(result)["mem_bw_gbps"] == MI355X_CARD.memory_bandwidth_gbps
     roofline = Path(result["kernel_roofline_path"])
     assert roofline.is_file() and roofline.is_relative_to(
         served.session / "tool-results"
@@ -300,13 +319,23 @@ async def test_the_platform_of_the_request_is_the_one_analysed_for(served: Local
     assert _arch_used(record["result"])["name"] == "MI300X"  # the arch TraceLens bundles
 
 
-async def test_a_gpu_no_one_has_peaks_for_fails_the_job_by_name_and_starts_no_analysis(
+async def test_a_gpu_tracelens_has_no_spec_for_in_a_session_without_a_card_fails_the_job_by_name_and_starts_no_analysis(
     served: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(roofline_module, "trace_analyze_handler", _never)
     status, record = await _roofline(served, TRACE, target_platform="MI999X")
     assert status is JobStatus.FAILED and record["result"]["error_class"] == "unknown_gpu_arch"
     assert "'MI999X'" in record["summary"]
+
+
+async def test_a_card_that_reports_no_memory_bandwidth_gives_no_vendor_peaks_so_the_job_fails_by_name(
+    served: Local, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    publish_card(monkeypatch, dataclasses.replace(MI355X_CARD, memory_bandwidth_gbps=None))
+    monkeypatch.setattr(roofline_module, "trace_analyze_handler", _never)
+    status, record = await _roofline(served, TRACE)
+    assert status is JobStatus.FAILED and record["result"]["error_class"] == "unknown_gpu_arch"
+    assert f"'{SESSION_LABEL}'" in record["summary"]
 
 
 async def test_the_roofline_needs_a_profile_test_it_does_not_profile_itself(served: Local) -> None:
@@ -324,6 +353,7 @@ async def test_a_route_other_than_non_llm_fails_the_job_by_name_and_starts_no_an
     assert record["result"]["error_class"] == "invalid_analysis_route"
 
 
+@pytest.mark.usefixtures("mi355x_session")
 async def test_the_route_the_host_environment_names_is_not_the_rooflines(
     served: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -344,6 +374,7 @@ async def test_a_trace_with_no_kernel_or_no_trace_fails_the_job_instead_of_answe
     assert record["summary"].startswith(("none of the first", "trace_input does not exist", "no trace files"))
 
 
+@pytest.mark.usefixtures("mi355x_session")
 async def test_an_analysis_that_scanned_none_of_the_traces_kernels_fails_the_job_instead_of_answering_ok(
     served: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,16 +398,27 @@ async def test_an_analysis_that_scanned_none_of_the_traces_kernels_fails_the_job
 async def test_a_specialist_gets_the_pull_requests_a_search_finds(
     served: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    github = _install(monkeypatch, Github([_pr(42, "Faster MoE decode"), _pr(7, "Fix gemm tuning")]))
+    github = _install(monkeypatch, Github([_pr(42, "Faster MoE decode"), _pr(7, "Fix gemm tuning")], matched=45))
     status, record = await _search(served, keywords=["moe"], limit=2)
     assert status is JobStatus.SUCCEEDED
     assert [(c["ref"], c["title"]) for c in record["result"]["candidates"]] == [
         ("PR:42", "Faster MoE decode"),
         ("PR:7", "Fix gemm tuning"),
     ]
-    assert record["summary"] == f"2 upstream PR candidate(s) in {SGLANG}; top: PR:42 Faster MoE decode"
+    assert (record["result"]["matched_prs"], record["result"]["not_shown"]) == (45, 43)
+    assert record["summary"] == f"2 of 45 upstream PR candidate(s) in {SGLANG}; top: PR:42 Faster MoE decode"
     ((url, *_),) = github.requests
     assert "repo%3Asgl-project%2Fsglang" in url and "moe" in url and "per_page=2" in url
+
+
+async def test_a_search_that_names_no_limit_asks_for_ten_candidates(
+    served: Local, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    github = _install(monkeypatch, Github([_pr(number, "Faster MoE decode") for number in range(1, 13)]))
+    _, record = await _search(served, keywords=["moe"])
+    assert (len(record["result"]["candidates"]), record["result"]["not_shown"]) == (10, 2)
+    ((url, *_),) = github.requests
+    assert "per_page=10" in url
 
 
 async def test_the_search_is_made_by_the_toolbox_process_with_its_token_and_the_token_is_not_in_the_result(
@@ -390,6 +432,26 @@ async def test_the_search_is_made_by_the_toolbox_process_with_its_token_and_the_
     assert HOST_TOKEN not in json.dumps(record)
 
 
+@pytest.mark.parametrize(
+    ("token", "level", "said"),
+    [
+        (HOST_TOKEN, logging.INFO, "upstream PR search asks GitHub with this host's token"),
+        ("", logging.WARNING, "upstream PR search has no GitHub token: neither GITHUB_TOKEN nor GH_TOKEN is set"),
+    ],
+    ids=["token", "anonymous"],
+)
+async def test_a_toolbox_that_searches_logs_once_whether_it_asks_github_with_a_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, token: str, level: int, said: str
+) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", token)
+    with caplog.at_level(logging.INFO):
+        async for _ in _serve(tmp_path):
+            pass
+    (line,) = [record for record in caplog.records if "upstream PR search" in record.getMessage()]
+    assert line.levelno == level and line.getMessage().startswith(said)
+    assert HOST_TOKEN not in caplog.text
+
+
 def test_a_sandbox_is_not_given_the_hosts_github_token(tmp_path: Path) -> None:
     template = _runner_template(LocalSession(tmp_path / "session", "run-1", [0]), LocalOptions())
     assert not {"GITHUB_TOKEN", "GH_TOKEN"} & set(template.envs)
@@ -401,6 +463,7 @@ async def test_no_match_on_a_github_that_answers_is_a_success_with_no_candidates
     github = _install(monkeypatch, Github([]))
     status, record = await _search(served, keywords=["nothing-matches-this"])
     assert status is JobStatus.SUCCEEDED and record["result"]["candidates"] == []
+    assert (record["result"]["matched_prs"], record["result"]["not_shown"]) == (0, 0)
     assert len(github.requests) == 1
 
 
@@ -408,14 +471,24 @@ async def test_no_match_on_a_github_that_answers_is_a_success_with_no_candidates
     ("github", "reason"),
     [
         (Github(failing=urllib.error.URLError("unreachable")), "cannot be reached from this host (URLError)"),
-        (Github(failing=_http_error(403)), "refused the search (HTTP 403), most likely a rate limit"),
-        (Github(failing=_http_error(429)), "refused the search (HTTP 429), most likely a rate limit"),
+        (Github(failing=_http_error(403)), "does not allow this host's token the search (HTTP 403); asking again"),
+        (Github(failing=_http_error(429, **{"Retry-After": "40"})), "is spent (HTTP 429): ask again in 40 s"),
+        (Github(failing=ValueError(f"Invalid header value b'Bearer {HOST_TOKEN}'")), "holds a line break"),
         (Github(failing=_http_error(401)), "rejected the token"),
         (Github(failing=_http_error(422)), "answered the search with HTTP 422"),
         (Github(failing=TimeoutError("slow")), "(TimeoutError)"),
         (Github(answer={"message": "API rate limit exceeded"}), "not a search result"),
     ],
-    ids=["no-network", "rate-limited", "too-many", "token-rejected", "bad-query", "timeout", "not-a-result"],
+    ids=[
+        "no-network",
+        "token-not-allowed",
+        "rate-limited",
+        "token-no-header",
+        "token-rejected",
+        "bad-query",
+        "timeout",
+        "not-a-result",
+    ],
 )
 async def test_a_github_that_cannot_search_fails_the_job_with_why_it_is_not_an_empty_list(
     served: Local, monkeypatch: pytest.MonkeyPatch, github: Github, reason: str
@@ -431,9 +504,9 @@ async def test_without_a_token_the_failure_says_the_host_has_none(
     served: Local, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("GITHUB_TOKEN")
-    _install(monkeypatch, Github(failing=_http_error(403)))
+    _install(monkeypatch, Github(failing=_http_error(403, **{"Retry-After": "40"})))
     _, record = await _search(served)
-    assert "the host has no GITHUB_TOKEN or GH_TOKEN" in record["error"]
+    assert "ask again in 40 s; the host has no GITHUB_TOKEN or GH_TOKEN" in record["error"]
 
 
 async def test_a_search_with_a_token_does_not_tell_the_host_to_get_one(
@@ -450,7 +523,6 @@ async def test_a_search_with_a_token_does_not_tell_the_host_to_get_one(
         ({"repo_url": "https://github.com/someone/private-repo"}, "someone/private-repo is not an upstream repository"),
         ({"repo_url": "not a url"}, "not a GitHub repository URL"),
         ({"repo_url": SGLANG, "limit": 99}, "between 1 and 20"),
-        ({"repo_url": SGLANG, "pr_monitor_url": "http://internal.example/"}, "server_owned_param"),
     ],
 )
 async def test_a_search_that_can_never_run_is_refused_before_it_starts(

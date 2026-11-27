@@ -29,6 +29,7 @@ from inference_suite.contracts import (
     LifecycleMode,
     MlperfWorkload,
     ProfileConfig,
+    PromptDataset,
     RunnerLayer,
     RunPaths,
     ScriptableWorkload,
@@ -121,7 +122,11 @@ def _accuracy_round(**changes) -> SuiteConfig:
     )
 
 
-@pytest.mark.parametrize("config", [_config(), _accuracy_round()], ids=["agentx-profile", "accuracy-round"])
+@pytest.mark.parametrize(
+    "config",
+    [_config(), _accuracy_round(), _config(server=replace(_config().server, cpus=(32, 33)))],
+    ids=["agentx-profile", "accuracy-round", "pinned-server"],
+)
 def test_round_trip_through_json(config):
     document = json.loads(json.dumps(config.to_document()))
 
@@ -132,7 +137,19 @@ def test_round_trip_through_json(config):
     assert SuiteConfig.from_document(document).to_document() == document
 
 
+def test_an_unpinned_server_writes_no_cpus_key_so_a_build_without_it_reads_the_config():
+    assert "cpus" not in _config().to_document()["server"]
+
+
 _SCRIPT = ScriptableWorkload(params={"XDIT_NUM_STEPS": 28, "XDIT_GUIDANCE_SCALE": 4.0})
+
+
+def test_a_fixed_workload_round_trips_its_prompt_dataset_and_a_random_one_writes_none():
+    dataset = replace(_FIXED, dataset=PromptDataset("/data/prompts.jsonl"))
+    document = json.loads(json.dumps(dataset.to_document()))
+    assert document["dataset"] == {"path": "/data/prompts.jsonl"}
+    assert FixedWorkload.from_document(document) == dataset
+    assert "dataset" not in _FIXED.to_document()
 
 
 def test_round_trip_fixed_and_scriptable():
@@ -306,6 +323,22 @@ def test_defaulted_deadline_keys_may_be_omitted():
     assert SuiteConfig.from_document(document).deadlines == replace(
         _config().deadlines, pre_ready_silence_sec=DEFAULT_PRE_READY_SILENCE_SEC, deadline_unix=None
     )
+
+
+def test_a_boot_budget_round_trips_and_is_written_only_when_set():
+    config = _config()
+    assert "boot_budget_sec" not in config.to_document()["deadlines"]
+    assert SuiteConfig.from_document(config.to_document()).deadlines.boot_budget_sec is None
+
+    budgeted = replace(config, deadlines=replace(config.deadlines, boot_budget_sec=14400.0))
+    assert budgeted.to_document()["deadlines"]["boot_budget_sec"] == 14400.0
+    assert SuiteConfig.from_document(budgeted.to_document()).deadlines == budgeted.deadlines
+
+
+@pytest.mark.parametrize("budget", [0, -1, "14400", True])
+def test_a_boot_budget_that_is_not_a_positive_number_is_refused(budget):
+    with pytest.raises(ConfigError, match="the boot budget"):
+        replace(_config().deadlines, boot_budget_sec=budget)
 
 
 def test_eval_probe_is_required():

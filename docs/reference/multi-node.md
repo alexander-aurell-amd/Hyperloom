@@ -24,6 +24,7 @@ differ only in how Hyperloom restarts the inference server each optimization rou
 |---------|--------------|-------|
 | `infera` | SSH | Hyperloom SSHes into each pod to launch or restart SGLang. Supports prefill/decode (PD) disaggregation. |
 | `rayjob` | Ray Dashboard REST API | Pods form a KubeRay cluster. Restarts go through the Ray Dashboard; no SSH required. |
+| `atomesh`, `sglangrouter` | SSH | A PD-disaggregated cluster handed over as a node list (`HYPERLOOM_MN_NODE_LIST`); InferenceSuite launches its router and engines over SSH. `infera` also takes a node list. |
 
 ## Cluster hand-off
 
@@ -65,6 +66,12 @@ The following table lists all hand-off variables.
 | `HYPERLOOM_MN_EXT_HEAD_IP` | rayjob | no | Ray head IP — Dashboard on `:8265`, GCS on `:6379` (KubeRay's `<rayCluster>-head-svc`). Omit for benchmark-only mode with no per-round restarts. |
 | `HYPERLOOM_MN_EXT_RAY_DASHBOARD_TOKEN` | rayjob | no | Ray Dashboard auth token, if the dashboard requires authentication. |
 
+A node-list cluster is handed over in one variable instead:
+
+| Variable | Backend | Required | Meaning |
+|----------|---------|----------|---------|
+| `HYPERLOOM_MN_NODE_LIST` | atomesh, sglangrouter, infera | atomesh and sglangrouter | JSON node list: framework, model, `service_url` and optional per-role engine URLs, `mode` (`disaggregated` by default, or `aggregated`), the router host and each role's hosts, `gpus_per_node`, `ssh` access (key path, shared port, per-host `ssh_port`), the KV transfer backend, the frontend, the operator's topology and args, and the launcher (`direct` over SSH, or `in_place`). Unknown keys are refused. Without `--mn-backend`, the node list's frontend selects the backend. |
+
 The container image and per-pod CPU or memory are the provisioning platform's
 inputs, not `optimize` flags.
 
@@ -104,14 +111,6 @@ cluster expects. KubeRay runs `ray start` in the head and worker containers:
 ```bash
 python -m pip install "ray[default]==2.44.1"
 ```
-
-Pin no `click` version. What the image owes is a Ray whose `ray start` parses
-the argv Hyperloom passes; preflight and the kernel-tools installer certify
-exactly that, by handing a representative argv to Ray's own parser. A `click`
-release that leaves the CLI parsing is no reason to downgrade it. The one
-exception is Ray 2.44.1 failing to import its CLI under `click` 8.3+ (`is not a
-valid Sentinel`): there Hyperloom holds `click<8.3` once. Any other failure calls
-for a Ray release built against your `click`, through `RAY_VERSION`.
 
 The cluster idles through the RayJob submitter: the platform sets its entrypoint
 to `tail -f /dev/null` so the cluster stays up between rounds.
@@ -165,12 +164,12 @@ The following flags are used in multi-node workload skill blocks.
 |------|---------|
 | `--model` | Model path under `${NFS_SHARED_ROOT}/models/...` or a HuggingFace repo ID |
 | `--nodes` | Node count; must be `>= 2` and match the cluster handed over |
-| `--mn-backend` | `infera` or `rayjob` |
+| `--mn-backend` | `rayjob`, `infera`, `atomesh`, or `sglangrouter` (atomesh and sglangrouter need `HYPERLOOM_MN_NODE_LIST`) |
 | `--gpus-per-node` | GPUs per pod (default 8); feeds the TP feasibility check |
 | `--tp` | Tensor parallelism degree |
 | `--ep` | Expert parallelism degree (MoE; often `ep == tp`) |
 | `--isl`, `--osl`, `--conc` | Benchmark input length, output length, and concurrency. The flag wins; on a fresh launch the corresponding env var is next, then the default. On a resume it is the pins in effect for this resume (its own `--extra-env`, or the launch's persisted pins when it passes none), then the session's recorded value, then the env var, then the default |
-| `--gpu-type`, `--precision` | Target GPU (for example `mi325x`) and dtype (`bf16`). `--precision` has its own ladder on both branches: the flag, then `$PRECISION`, then the session's recorded value, then the checkpoint's dtype, then the default. `--gpu-type` is a hint: on a fresh launch the hardware probe wins and a disagreeing flag only warns; a resume takes the GPU type from the session and ignores the flag |
+| `--gpu-type`, `--precision` | Target GPU (for example `mi325x`) and dtype (`bf16`). `--precision` has its own ladder on both branches: the flag, then `$PRECISION`, then the session's recorded value, then the checkpoint's dtype, then the default. The GPU type is the market name a remote node reports (through `amd-smi`, else `rocm-smi`, else torch), reduced to its model designation; `--gpu-type` (any name) is used when the node reports none, and a flag the card contradicts is overridden with a warning. A resume takes the GPU type from the session and ignores the flag, and reads the remote card again |
 | `--framework` | `sglang` |
 | `--target-gain`, `--max-hours` | Optimization goal and time budget |
 | `--pd-mode disaggregated` | Enable PD disaggregation (infera and rayjob) |
@@ -243,26 +242,6 @@ tokens on some configurations.
 
 ---
 
-### Ray `--num-gpus` rejected (rayjob)
-
-**Symptom**: `ray start --head --num-gpus=N` fails with `Error: no such option:
---num-gpus`, or preflight reports `ray start does not accept ...`.
-
-**Cause**: The image's Ray CLI does not parse the argv Hyperloom passes — an
-option it dropped, a value it narrowed, or a `click` release that breaks the
-CLI on import.
-
-**Fix**: reinstall Ray at the version Hyperloom pins; Hyperloom itself holds
-`click<8.3` only when 2.44.1's CLI fails with `is not a valid Sentinel`. For any
-other `click` conflict, set `RAY_VERSION` to a Ray release built against it.
-
-```bash
-pip install --quiet 'ray[default]==2.44.1'
-ray --version
-```
-
----
-
 ### Ray tasks stuck pending, GPU usage 0% (rayjob)
 
 **Cause**: Ray was started with `--num-gpus=0` or the flag was omitted. Tasks
@@ -278,8 +257,8 @@ ray start --head --disable-usage-stats --num-gpus="$RAY_NUM_GPUS" --include-dash
 ray status
 ```
 
-If a stale Ray head is already running, stop it first so Hyperloom can create a
-fresh head with the correct GPU and resource configuration.
+If a stale Ray head is already running, stop it first so the new head starts
+with the correct GPU configuration.
 
 ---
 
@@ -298,8 +277,8 @@ raised from inside the container:
 docker run --ulimit nofile=1048576 ...
 ```
 
-The runtime raises the soft limit automatically before `ray start`; the hard cap
-must be set at container launch time.
+Inside the container, `ulimit -Sn` raises the soft limit up to that cap before
+`ray start`; the hard cap must be set at container launch time.
 
 ---
 

@@ -75,31 +75,6 @@ def test_a_misspelled_flag_fails_fast(typo):
     assert exc.value.code == 2
 
 
-@pytest.mark.parametrize(
-    "flag",
-    [
-        "--robustness-mock",
-        "--robustness-agent",
-        "--robustness-llm-rca",
-        "--no-robustness-llm-rca",
-        "--robustness-disable-local-probe",
-        "--no-robustness-disable-local-probe",
-        "--robustness-disable-server-probe",
-        "--no-robustness-disable-server-probe",
-        "--explore-overtime-kill-ratio",
-        "--explore-variant-timeout-sec",
-        "--explore-variant-timeout-safety-margin",
-        "--conc-sweep-timeout-sec",
-    ],
-)
-def test_retired_watchdog_flags_are_rejected(flag, capsys):
-    values = ["1"] if flag.startswith(("--explore-", "--conc-sweep-")) else []
-    with pytest.raises(SystemExit) as exc:
-        _parse(flag, *values)
-    assert exc.value.code == 2
-    assert "unrecognized arguments" in capsys.readouterr().err
-
-
 def test_unambiguous_abbreviations_still_work():
     """Strictness must not cost argparse's normal prefix matching."""
     assert _parse("--max-hour", "10").max_hours == 10.0
@@ -130,3 +105,9 @@ def test_rejection_message_keeps_a_typo_readable(capsys):
 def test_redaction_helper_is_shared_with_the_parser():
     """The parser reuses the same helper the CLI logs with, not a second copy."""
     assert _redact_unknown_args(["--api-key", "sk-live"]) == "--api-key ***"
+
+
+def test_the_profile_abbreviation_resolves_to_profile_osl():
+    """No flag is spelled ``--profile``, so argparse reads it as the prefix of ``--profile-osl``."""
+    assert _parse("--profile", "1024").profile_osl == 1024
+    assert _parse("--profile-osl", "128").profile_osl == 128

@@ -49,13 +49,13 @@ from hyperloom_multibranch.toolbox.branch_leases import LEASE_WAIT_SECONDS, leas
 from hyperloom_multibranch.toolbox.lease_ledger import LeaseLedger
 
 __all__ = [
-    "HANDOVER_MIN_TESTS",
     "LIFETIME_MARGIN_SEC",
     "DevSession",
     "GrantLimits",
     "HostedBranchLease",
     "HostedBranchLeases",
     "LeaseTuning",
+    "lease_shortfall",
 ]
 
 log = logging.getLogger(__name__)
@@ -67,9 +67,6 @@ LEASE_PURPOSE = "dev-lease"
 #: Between a holder's own end, or the grant's runtime, and the end of its sandbox: the holder's stop, its processes'
 #: grace and the release that ends the sandbox come first.
 LIFETIME_MARGIN_SEC = 300
-#: The fewest tests of the session's TP the grant must fit for make-before-break to keep a finished test's sandbox:
-#: the kept sandbox holds one test's room, so it costs at most a third of the tests at once, never half where two fit.
-HANDOVER_MIN_TESTS = 3
 _CLOSING = "the toolbox is closing"
 _POLL_SEC = 0.2
 
@@ -91,6 +88,24 @@ class GrantLimits:
     def __post_init__(self) -> None:
         if min(self.max_sandboxes, self.max_gpus, self.max_runtime_sec) < 1 or self.gpu_hours <= 0:
             raise ValueError("a grant has at least one sandbox, one GPU, one second and some GPU hours")
+
+
+def lease_shortfall(grant: GrantLimits, tp: int) -> str | None:
+    """Why ``grant`` can never admit one lease of ``tp`` cards, which must leave one test of ``tp`` cards its room and
+    its sandbox (what :class:`HostedBranchLeases` refuses as ``lease_leaves_no_measurement`` with no lease held), or
+    ``None`` when it can."""
+
+    if grant.max_gpus < 2 * tp:
+        return (
+            f"the grant's {grant.max_gpus} GPUs leave no {tp}-card dev sandbox beside one {tp}-card test"
+            f" (max_gpus must be at least {2 * tp})"
+        )
+    if grant.max_sandboxes < 2:
+        return (
+            f"the grant's {grant.max_sandboxes} sandbox leaves none for a dev sandbox beside one test"
+            " (max_sandboxes must be at least 2)"
+        )
+    return None
 
 
 @dataclass(frozen=True)
@@ -181,7 +196,6 @@ class HostedBranchLeases:
         self._closed = False
         self.on_release: Callable[[], None] = _nothing
         self.ledger = LeaseLedger()
-        self._make_room: Callable[[], None] | None = None
 
     def capacity(self) -> MeasurementCapacity:
         """The grant's GPUs, with the cards promised to leases counted as leased."""
@@ -189,33 +203,14 @@ class HostedBranchLeases:
         with self._guard:
             return self._capacity()
 
-    def reserved(self) -> tuple[int, int]:
-        """How many of the grant's sandboxes and GPUs the leases hold or are promised, safe from any thread."""
-
-        with self._guard:
-            return len(self._promised), min(sum(self._promised.values()), self._grant.max_gpus)
-
-    def keep_room_for_handover(self, make_room: Callable[[], None]) -> None:
-        """Share the grant with a measurement pool that keeps a finished test's sandbox for the next one
-        (make-before-break): :meth:`tests_at_once` leaves one test's room of what the leases leave free for that
-        overlap, and every promised lease first calls ``make_room`` (on a thread), which closes the kept sandbox when
-        the grant has no room for it beside the new lease, so a branch's ``dev`` sandbox outranks it."""
-
-        self._make_room = make_room
-
     def tests_at_once(self) -> int:
         """How many tests the cards and sandboxes left for measurement run at once, at least one so that a toolbox
-        which lost them fails its tests instead of parking them. With make-before-break
-        (:meth:`keep_room_for_handover`) one test's room is left free for the kept sandbox where what the leases leave
-        fits at least :data:`HANDOVER_MIN_TESTS` tests; where it fits fewer, every test runs and no room is left."""
+        which lost them fails its tests instead of parking them."""
 
         with self._guard:
             by_cards = self._capacity().measurement_cards // self._session.tp
             by_sandboxes = self._grant.max_sandboxes - len(self._promised)
-        fits = min(by_cards, by_sandboxes)
-        if self._make_room is not None and fits >= HANDOVER_MIN_TESTS:
-            fits -= 1
-        return max(1, fits)
+        return max(1, min(by_cards, by_sandboxes))
 
     async def lease(
         self,
@@ -254,8 +249,6 @@ class HostedBranchLeases:
         self._promise(branch_id, cards)
         made: Sandbox | None = None
         try:
-            if self._make_room is not None:
-                await asyncio.to_thread(self._make_room)
             lifetime, requested_at = self.lifetime_sec(lifetime_sec), self.ledger.clock()
             made = await self._create(branch_id, wait, lifetime)
             lease = self._grant_lease(branch_id, made, lifetime)

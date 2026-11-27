@@ -67,14 +67,6 @@ def _single_node(monkeypatch):
     monkeypatch.setattr(mne, "is_multi_node", lambda: False)
 
 
-@pytest.fixture(autouse=True)
-def _no_candidate_discovery(monkeypatch):
-    """Keep the real param builder off the network."""
-    import hyperloom.agents.framework.sources as sources
-
-    monkeypatch.setattr(sources, "enumerate_candidates", lambda _request: [])
-
-
 def _events(session_dir: Path) -> list[dict[str, Any]]:
     return [event for event in read_timeline_events(session_dir) if event.get("type") == "enablement"]
 
@@ -187,8 +179,9 @@ def _lane(session_dir: Path, **overrides: Any):
     )
     for name in ("registry_lanes_ttl",):
         setattr(fake, name, types.MethodType(getattr(DispatcherCollaborator, name), fake))
-    for name in ("build_enablement_specialist_params", "_discover_enablement_candidate_refs"):
-        setattr(fake, name, types.MethodType(getattr(EnablementParams, name), fake))
+    fake.build_enablement_specialist_params = types.MethodType(
+        EnablementParams.build_enablement_specialist_params, fake
+    )
     for name in (
         "_maybe_enqueue_enablement_specialist",
         "_maybe_record_enablement_human_review",
@@ -206,8 +199,10 @@ def _lane(session_dir: Path, **overrides: Any):
     # The round ledger's own surface: the cap, the lease and the settle all live on it.
     for name in (
         "enablement_admitted",
+        "_reached_terminal",
         "_check_argv_terminal",
         "_check_environment_terminal",
+        "_check_source_change_terminal",
         "enablement_in_flight",
         "_round_has_live_work",
         "_open_authoring_round",
